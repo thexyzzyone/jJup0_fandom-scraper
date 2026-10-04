@@ -1,0 +1,5 @@
+# Scraped wiki data stays local; only this file and the layout guide (AGENTS.md, imported by CLAUDE.md) are committed
+*
+!.gitignore
+!AGENTS.md
+!CLAUDE.md

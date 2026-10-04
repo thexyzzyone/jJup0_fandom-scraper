@@ -1,6 +1,5 @@
 *.db
 *.db-journal
-*-mediawiki/
 static/*/
 __pycache__/
 *.pyc

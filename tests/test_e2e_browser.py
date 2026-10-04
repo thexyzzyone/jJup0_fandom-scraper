@@ -22,10 +22,12 @@ if TYPE_CHECKING:
 def server_url() -> Generator[str, None, None]:
     """Start the actual server with the gorogoa wiki (must exist)."""
     project_dir = os.path.dirname(os.path.dirname(__file__))
-    db_path = os.path.join(project_dir, "gorogoa.db")
+    db_path = os.path.join(project_dir, "hive", "gorogoa", "gorogoa.db")
 
     if not os.path.exists(db_path):
-        pytest.skip("gorogoa.db not found - run 'python scrape.py gorogoa' first")
+        pytest.skip(
+            "hive/gorogoa/gorogoa.db not found - run 'python scrape.py gorogoa' first"
+        )
 
     port = 5099
     proc = subprocess.Popen(
@@ -40,7 +42,9 @@ def server_url() -> Generator[str, None, None]:
     proc.wait(timeout=5)
 
 
-ARTIFACTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "test-artifacts")
+ARTIFACTS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "test-artifacts"
+)
 
 
 @pytest.fixture
@@ -101,7 +105,9 @@ def test_search_works(page: tuple[Page, str]) -> None:
     pg.locator(".count").wait_for(timeout=5000)
     # Wait for the result list to actually shrink
     expect(pg.locator("#results li")).not_to_have_count(initial_count, timeout=3000)
-    assert pg.locator("#results li").count() < initial_count, "search should filter results"
+    assert (
+        pg.locator("#results li").count() < initial_count
+    ), "search should filter results"
     assert pg.locator(".snip").count() > 0, "search results should have text snippets"
 
 

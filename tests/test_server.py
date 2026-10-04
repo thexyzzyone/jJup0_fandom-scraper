@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -231,7 +232,7 @@ class TestImageProxy:
         img_dir = tmp_path / "testwiki" / "images"
         img_dir.mkdir(parents=True)
         (img_dir / "local.png").write_bytes(b"PNG_DATA")
-        server.app.static_folder = str(tmp_path)
+        server._wiki_static = str(tmp_path / "testwiki")
         resp = client.get("/image-proxy/testwiki/local.png")
         assert resp.status_code == 200
         assert resp.data == b"PNG_DATA"
@@ -244,7 +245,7 @@ class TestImageProxy:
 
         img_dir = tmp_path / "testwiki" / "images"
         img_dir.mkdir(parents=True)
-        server.app.static_folder = str(tmp_path)
+        server._wiki_static = str(tmp_path / "testwiki")
 
         api_resp = MagicMock()
         api_resp.json.return_value = {
@@ -273,7 +274,7 @@ class TestImageProxy:
         import server
 
         (tmp_path / "testwiki" / "images").mkdir(parents=True)
-        server.app.static_folder = str(tmp_path)
+        server._wiki_static = str(tmp_path / "testwiki")
         api_resp = MagicMock()
         api_resp.json.return_value = {
             "query": {"pages": {"-1": {"title": "File:nope.png", "missing": ""}}}
@@ -290,7 +291,7 @@ class TestImageProxy:
         import server
 
         (tmp_path / "testwiki" / "images").mkdir(parents=True)
-        server.app.static_folder = str(tmp_path)
+        server._wiki_static = str(tmp_path / "testwiki")
         mock_get.side_effect = Exception("connection refused")
 
         resp = client.get("/image-proxy/testwiki/fail.png")
@@ -302,9 +303,64 @@ class TestImageProxy:
         img_dir = tmp_path / "testwiki" / "images"
         img_dir.mkdir(parents=True)
         (img_dir / "a_b.png").write_bytes(b"IMG")
-        server.app.static_folder = str(tmp_path)
+        server._wiki_static = str(tmp_path / "testwiki")
         resp = client.get("/image-proxy/testwiki/a/b.png")
         assert resp.status_code == 200
+
+    @patch("server.http_requests.get")
+    def test_other_wiki_is_404(
+        self, mock_get: MagicMock, client: FlaskClient, tmp_path: Path
+    ) -> None:
+        import server
+
+        server._wiki_static = str(tmp_path / "testwiki")
+        for wiki in ["otherwiki", ".."]:
+            resp = client.get(f"/image-proxy/{wiki}/x.png")
+            assert resp.status_code == 404
+        mock_get.assert_not_called()
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["test.db"]
+
+
+class TestStaticFiles:
+    """/static/<wiki>/... comes from the hive; the rest is the shared static/."""
+
+    def test_wiki_files_from_hive(self, client: FlaskClient, tmp_path: Path) -> None:
+        import server
+
+        wiki_static = tmp_path / "testwiki" / "static"
+        (wiki_static / "images").mkdir(parents=True)
+        (wiki_static / "theme.css").write_text(":root{}")
+        (wiki_static / "images" / "a.png").write_bytes(b"PNG")
+        server._wiki_static = str(wiki_static)
+
+        assert client.get("/static/testwiki/theme.css").data == b":root{}"
+        assert client.get("/static/testwiki/images/a.png").data == b"PNG"
+
+    def test_shared_files_from_repo_static(
+        self, client: FlaskClient, tmp_path: Path
+    ) -> None:
+        import server
+
+        server._wiki_static = str(tmp_path)
+        resp = client.get("/static/fandom-all.css")
+        assert resp.status_code == 200
+        with open(os.path.join(server.SHARED_STATIC, "fandom-all.css"), "rb") as f:
+            assert resp.data == f.read()
+
+    def test_missing_and_traversal_are_404(
+        self, client: FlaskClient, tmp_path: Path
+    ) -> None:
+        import server
+
+        (tmp_path / "secret.txt").write_text("nope")
+        server._wiki_static = str(tmp_path / "static")
+        (tmp_path / "static").mkdir()
+        for url in [
+            "/static/testwiki/missing.png",
+            "/static/testwiki/../secret.txt",
+            "/static/testwiki/%2e%2e/secret.txt",
+        ]:
+            assert client.get(url).status_code == 404
 
 
 class TestApiSearch:

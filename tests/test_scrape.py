@@ -427,13 +427,7 @@ class TestDownloadImage:
         scrape._wiki_name = "tw"
         self.img_dir = tmp_path / "static" / "tw" / "images"
         self.img_dir.mkdir(parents=True)
-        monkeypatch.setattr(
-            scrape.os.path,
-            "dirname",
-            lambda f, _orig=os.path.dirname: (
-                str(tmp_path) if f == scrape.__file__ else _orig(f)
-            ),
-        )
+        monkeypatch.setattr(scrape, "_images_dir", str(self.img_dir))
 
     def test_skips_existing(self) -> None:
         (self.img_dir / "existing.png").write_bytes(b"old")
@@ -470,10 +464,10 @@ class TestMainIntegration:
     def test_scrape_stores_and_rewrites(
         self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
     ) -> None:
-        db_path = str(tmp_path / "test.db")
-        img_dir = tmp_path / "static" / "mywiki" / "images"
+        db_path = str(tmp_path / "mywiki" / "mywiki.db")
+        img_dir = tmp_path / "mywiki" / "static" / "images"
         img_dir.mkdir(parents=True)
-        theme_dir = tmp_path / "static" / "mywiki"
+        theme_dir = tmp_path / "mywiki" / "static"
 
         # Mock responses in order: theme, allpages, parse, imageinfo, image download
         theme_resp = MagicMock()
@@ -533,17 +527,8 @@ class TestMainIntegration:
             img_download_resp,
         ]
 
-        # Patch dirname to redirect file writes to tmp_path
-        orig_dirname = os.path.dirname
-
-        def fake_dirname(p: str) -> str:
-            if p == scrape.__file__:
-                return str(tmp_path)
-            return orig_dirname(p)
-
-        with patch("scrape.os.path.dirname", side_effect=fake_dirname):
-            with patch("sys.argv", ["scrape.py", "mywiki", "--db", db_path]):
-                scrape.main()
+        with patch("sys.argv", ["scrape.py", "mywiki", "--hive", str(tmp_path)]):
+            scrape.main()
 
         # Verify DB has the page with rewritten HTML
         conn = sqlite3.connect(db_path)
@@ -568,8 +553,7 @@ class TestMainIntegration:
         self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
     ) -> None:
         """Second run with same touched timestamp should not re-parse pages."""
-        db_path = str(tmp_path / "test.db")
-        (tmp_path / "static" / "mywiki" / "images").mkdir(parents=True)
+        (tmp_path / "mywiki" / "static" / "images").mkdir(parents=True)
 
         theme_resp = MagicMock(text=":root{}")
         allpages_resp = _mock_resp(
@@ -589,23 +573,16 @@ class TestMainIntegration:
             {"parse": {"text": {"*": "<p>hi</p>"}, "categories": [], "images": []}}
         )
 
-        orig_dirname = os.path.dirname
-        fake_dirname = lambda p: (
-            str(tmp_path) if p == scrape.__file__ else orig_dirname(p)
-        )
-
         # First run: scrapes the page
         mock_get.side_effect = [theme_resp, allpages_resp, parse_resp]
-        with patch("scrape.os.path.dirname", side_effect=fake_dirname):
-            with patch("sys.argv", ["scrape.py", "mywiki", "--db", db_path]):
-                scrape.main()
+        with patch("sys.argv", ["scrape.py", "mywiki", "--hive", str(tmp_path)]):
+            scrape.main()
 
         # Second run: same touched → no parse call expected (only theme + allpages)
         mock_get.reset_mock()
         mock_get.side_effect = [theme_resp, allpages_resp]
-        with patch("scrape.os.path.dirname", side_effect=fake_dirname):
-            with patch("sys.argv", ["scrape.py", "mywiki", "--db", db_path]):
-                scrape.main()
+        with patch("sys.argv", ["scrape.py", "mywiki", "--hive", str(tmp_path)]):
+            scrape.main()
         # Only 2 calls: theme download + allpages. No parse call.
         assert mock_get.call_count == 2
 
@@ -616,8 +593,8 @@ class TestMainIntegration:
         self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
     ) -> None:
         """Second run with newer touched timestamp should re-parse the page."""
-        db_path = str(tmp_path / "test.db")
-        (tmp_path / "static" / "mywiki" / "images").mkdir(parents=True)
+        db_path = str(tmp_path / "mywiki" / "mywiki.db")
+        (tmp_path / "mywiki" / "static" / "images").mkdir(parents=True)
 
         theme_resp = MagicMock(text=":root{}")
         allpages_v1 = _mock_resp(
@@ -637,16 +614,10 @@ class TestMainIntegration:
             {"parse": {"text": {"*": "<p>old</p>"}, "categories": [], "images": []}}
         )
 
-        orig_dirname = os.path.dirname
-        fake_dirname = lambda p: (
-            str(tmp_path) if p == scrape.__file__ else orig_dirname(p)
-        )
-
         # First run
         mock_get.side_effect = [theme_resp, allpages_v1, parse_v1]
-        with patch("scrape.os.path.dirname", side_effect=fake_dirname):
-            with patch("sys.argv", ["scrape.py", "mywiki", "--db", db_path]):
-                scrape.main()
+        with patch("sys.argv", ["scrape.py", "mywiki", "--hive", str(tmp_path)]):
+            scrape.main()
 
         # Second run: newer touched → should re-parse
         allpages_v2 = _mock_resp(
@@ -667,9 +638,8 @@ class TestMainIntegration:
         )
         mock_get.reset_mock()
         mock_get.side_effect = [theme_resp, allpages_v2, parse_v2]
-        with patch("scrape.os.path.dirname", side_effect=fake_dirname):
-            with patch("sys.argv", ["scrape.py", "mywiki", "--db", db_path]):
-                scrape.main()
+        with patch("sys.argv", ["scrape.py", "mywiki", "--hive", str(tmp_path)]):
+            scrape.main()
 
         conn = sqlite3.connect(db_path)
         html = conn.execute("SELECT html FROM pages WHERE pageid=1").fetchone()[0]
@@ -681,23 +651,17 @@ class TestMainIntegration:
     def test_nonexistent_wiki_creates_no_files(
         self, mock_get: MagicMock, tmp_path: Path
     ) -> None:
-        db_path = str(tmp_path / "test.db")
+        db_path = str(tmp_path / "fakewiki" / "fakewiki.db")
         resp = MagicMock(status_code=404)
         resp.json.return_value = {}
         mock_get.return_value = resp
 
-        orig_dirname = os.path.dirname
-        fake_dirname = lambda p: (
-            str(tmp_path) if p == scrape.__file__ else orig_dirname(p)
-        )
-
-        with patch("scrape.os.path.dirname", side_effect=fake_dirname):
-            with patch("sys.argv", ["scrape.py", "fakewiki", "--db", db_path]):
-                with pytest.raises(SystemExit):
-                    scrape.main()
+        with patch("sys.argv", ["scrape.py", "fakewiki", "--hive", str(tmp_path)]):
+            with pytest.raises(SystemExit):
+                scrape.main()
 
         assert not os.path.exists(db_path)
-        assert not os.path.exists(tmp_path / "static" / "fakewiki")
+        assert not os.path.exists(tmp_path / "fakewiki")
 
     @patch("scrape.verify_wiki_exists", return_value=True)
     @patch.object(scrape, "RATE_LIMIT", 0)
@@ -706,8 +670,7 @@ class TestMainIntegration:
         self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
     ) -> None:
         """Images for page 1 are downloaded before page 2 is even parsed (#6)."""
-        db_path = str(tmp_path / "test.db")
-        img_dir = tmp_path / "static" / "mywiki" / "images"
+        img_dir = tmp_path / "mywiki" / "static" / "images"
         img_dir.mkdir(parents=True)
 
         theme_resp = MagicMock(text=":root{}")
@@ -780,14 +743,8 @@ class TestMainIntegration:
 
         mock_get.side_effect = tracking_get
 
-        orig_dirname = os.path.dirname
-        fake_dirname = lambda p: (
-            str(tmp_path) if p == scrape.__file__ else orig_dirname(p)
-        )
-
-        with patch("scrape.os.path.dirname", side_effect=fake_dirname):
-            with patch("sys.argv", ["scrape.py", "mywiki", "--db", db_path]):
-                scrape.main()
+        with patch("sys.argv", ["scrape.py", "mywiki", "--hive", str(tmp_path)]):
+            scrape.main()
 
         # Image for page A resolved+downloaded before page B is parsed
         assert call_order.index("imageinfo") < call_order.index("parse:B")
@@ -799,8 +756,8 @@ class TestMainIntegration:
         self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
     ) -> None:
         """HTML in DB should have local image paths right after page is scraped (#4)."""
-        db_path = str(tmp_path / "test.db")
-        img_dir = tmp_path / "static" / "mywiki" / "images"
+        db_path = str(tmp_path / "mywiki" / "mywiki.db")
+        img_dir = tmp_path / "mywiki" / "static" / "images"
         img_dir.mkdir(parents=True)
 
         theme_resp = MagicMock(text=":root{}")
@@ -855,14 +812,8 @@ class TestMainIntegration:
             img_resp,
         ]
 
-        orig_dirname = os.path.dirname
-        fake_dirname = lambda p: (
-            str(tmp_path) if p == scrape.__file__ else orig_dirname(p)
-        )
-
-        with patch("scrape.os.path.dirname", side_effect=fake_dirname):
-            with patch("sys.argv", ["scrape.py", "mywiki", "--db", db_path]):
-                scrape.main()
+        with patch("sys.argv", ["scrape.py", "mywiki", "--hive", str(tmp_path)]):
+            scrape.main()
 
         conn = sqlite3.connect(db_path)
         html = conn.execute("SELECT html FROM pages WHERE pageid=1").fetchone()[0]
@@ -878,7 +829,13 @@ class TestMainIntegration:
 T1 = "2024-01-01T00:00:00Z"
 T2 = "2024-06-01T00:00:00Z"
 REMOTE_PIC = "https://static.wikia.nocookie.net/mywiki/pic.png"
-ONLY_WIKITEXT = ["--with-mediawiki", "--no-html", "--no-images", "--no-style"]
+ONLY_WIKITEXT = [
+    "--with-mediawiki",
+    "--no-html",
+    "--no-images",
+    "--prohibit-files",
+    "--no-style",
+]
 
 
 def _allpages(*pages: tuple[int, str, str]) -> MagicMock:
@@ -941,15 +898,35 @@ def _image_bytes() -> MagicMock:
     return MagicMock(iter_content=MagicMock(return_value=[b"PNG"]))
 
 
-def _run_main(tmp_path: Path, *extra: str) -> None:
-    orig_dirname = os.path.dirname
-    fake_dirname = lambda p: (
-        str(tmp_path) if p == scrape.__file__ else orig_dirname(p)
+def _imageinfo(*names: str) -> MagicMock:
+    return _mock_resp(
+        {
+            "query": {
+                "pages": {
+                    str(-i): {
+                        "title": f"File:{n}",
+                        "imageinfo": [{"url": f"https://static.example/{n}"}],
+                    }
+                    for i, n in enumerate(names, 1)
+                }
+            }
+        }
     )
-    argv = ["scrape.py", "mywiki", "--db", str(tmp_path / "test.db"), *extra]
-    with patch("scrape.os.path.dirname", side_effect=fake_dirname):
-        with patch("sys.argv", argv):
-            scrape.main()
+
+
+def _page_images(*names: str) -> MagicMock:
+    return _mock_resp(
+        {"query": {"pages": {"1": {"images": [{"title": f"File:{n}"} for n in names]}}}}
+    )
+
+
+MIXED_MEDIA = ("pic.png", "Laugh.WAV", "Song.ogg", "Trailer")
+
+
+def _run_main(tmp_path: Path, *extra: str) -> None:
+    argv = ["scrape.py", "mywiki", "--hive", str(tmp_path), *extra]
+    with patch("sys.argv", argv):
+        scrape.main()
 
 
 class TestWikitextFilename:
@@ -1054,19 +1031,19 @@ class TestContentFlags:
     @patch("scrape.verify_wiki_exists", return_value=True)
     @patch.object(scrape, "RATE_LIMIT", 0)
     @patch.object(scrape.SESSION, "get")
-    def test_no_images(
+    def test_no_images_no_files(
         self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
     ) -> None:
         theme = MagicMock(text=":root{}")
         # theme + allpages + parse: no imageinfo or image download requests
         mock_get.side_effect = [theme, _allpages((1, "P", T1)), _parse_with_pic()]
-        _run_main(tmp_path, "--no-images")
+        _run_main(tmp_path, "--no-images", "--prohibit-files")
 
         assert mock_get.call_count == 3
-        assert (tmp_path / "static" / "mywiki" / "theme.css").exists()
-        assert not (tmp_path / "static" / "mywiki" / "images").exists()
-        assert not (tmp_path / ".mywiki.status").exists()
-        conn = sqlite3.connect(tmp_path / "test.db")
+        assert (tmp_path / "mywiki" / "static" / "theme.css").exists()
+        assert not (tmp_path / "mywiki" / "static" / "images").exists()
+        assert not (tmp_path / "mywiki" / ".mywiki.status").exists()
+        conn = sqlite3.connect(tmp_path / "mywiki" / "mywiki.db")
         html = conn.execute("SELECT html FROM pages WHERE pageid=1").fetchone()[0]
         conn.close()
         assert f'src="{REMOTE_PIC}"' in html
@@ -1086,9 +1063,9 @@ class TestContentFlags:
         ]
         _run_main(tmp_path, "--no-style")
 
-        assert not (tmp_path / "static" / "mywiki" / "theme.css").exists()
-        assert (tmp_path / "static" / "mywiki" / "images" / "pic.png").exists()
-        conn = sqlite3.connect(tmp_path / "test.db")
+        assert not (tmp_path / "mywiki" / "static" / "theme.css").exists()
+        assert (tmp_path / "mywiki" / "static" / "images" / "pic.png").exists()
+        conn = sqlite3.connect(tmp_path / "mywiki" / "mywiki.db")
         html = conn.execute("SELECT html FROM pages WHERE pageid=1").fetchone()[0]
         conn.close()
         assert "/static/mywiki/images/pic.png" in html
@@ -1107,8 +1084,8 @@ class TestContentFlags:
         _run_main(tmp_path, "--no-html", "--no-style")
 
         assert mock_get.call_count == 3
-        assert (tmp_path / "static" / "mywiki" / "images" / "pic.png").exists()
-        assert not (tmp_path / "test.db").exists()
+        assert (tmp_path / "mywiki" / "static" / "images" / "pic.png").exists()
+        assert not (tmp_path / "mywiki" / "mywiki.db").exists()
 
     @patch("scrape.verify_wiki_exists", return_value=True)
     @patch.object(scrape, "RATE_LIMIT", 0)
@@ -1127,10 +1104,10 @@ class TestContentFlags:
         _run_main(tmp_path, "--with-mediawiki")
 
         assert mock_get.call_count == 6
-        out = tmp_path / "mywiki-mediawiki" / "P.1.mediawiki"
+        out = tmp_path / "mywiki" / "mediawiki" / "P.1.mediawiki"
         assert out.read_text(encoding="utf-8") == "'''hi'''"
-        assert (tmp_path / "static" / "mywiki" / "images" / "pic.png").exists()
-        conn = sqlite3.connect(tmp_path / "test.db")
+        assert (tmp_path / "mywiki" / "static" / "images" / "pic.png").exists()
+        conn = sqlite3.connect(tmp_path / "mywiki" / "mywiki.db")
         assert conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM wikitext_pages").fetchone()[0] == 1
         conn.close()
@@ -1139,16 +1116,120 @@ class TestContentFlags:
         with pytest.raises(SystemExit):
             _run_main(tmp_path, "--mediawiki-tracking", "manifest")
 
-    def test_everything_disabled_is_an_error(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "file_flag",
+        ["--prohibit-files", "--permit-file-types=", "--permit-file-types= , "],
+    )
+    def test_everything_disabled_is_an_error(
+        self, tmp_path: Path, file_flag: str
+    ) -> None:
         with pytest.raises(SystemExit):
-            _run_main(tmp_path, "--no-html", "--no-images", "--no-style")
+            _run_main(tmp_path, "--no-html", "--no-images", "--no-style", file_flag)
+
+    def test_prohibit_and_permit_are_exclusive(self, tmp_path: Path) -> None:
+        with pytest.raises(SystemExit):
+            _run_main(tmp_path, "--prohibit-files", "--permit-file-types=*.ogg")
+
+
+class TestFileFilters:
+    """--no-images, --prohibit-files and --permit-file-types."""
+
+    @pytest.mark.parametrize(
+        "args, expected",
+        [
+            ([], set(MIXED_MEDIA)),
+            (["--no-images"], {"Laugh.WAV", "Song.ogg", "Trailer"}),
+            (["--prohibit-files"], {"pic.png"}),
+            (["--permit-file-types="], {"pic.png"}),
+            # Images ignore the allowlist; globs are case-insensitive
+            (["--permit-file-types=*.wav"], {"pic.png", "Laugh.WAV"}),
+            (["--permit-file-types= *.OGG , *.m4v "], {"pic.png", "Song.ogg"}),
+            (["--no-images", "--permit-file-types=*.ogg"], {"Song.ogg"}),
+        ],
+    )
+    @patch("scrape.verify_wiki_exists", return_value=True)
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_no_html_download_selection(
+        self,
+        mock_get: MagicMock,
+        mock_verify: MagicMock,
+        tmp_path: Path,
+        args: list[str],
+        expected: set[str],
+    ) -> None:
+        mock_get.side_effect = [
+            _page_images(*MIXED_MEDIA),
+            _imageinfo(*sorted(expected)),
+            *[_image_bytes() for _ in expected],
+        ]
+        _run_main(tmp_path, "--no-html", "--no-style", *args)
+
+        requested = mock_get.call_args_list[1].kwargs["params"]["titles"].split("|")
+        assert {t.removeprefix("File:") for t in requested} == expected
+        img_dir = tmp_path / "mywiki" / "static" / "images"
+        assert {p.name for p in img_dir.iterdir()} == expected
+
+    @patch("scrape.verify_wiki_exists", return_value=True)
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_html_per_page_selection(
+        self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
+    ) -> None:
+        parse_resp = _mock_resp(
+            {
+                "parse": {
+                    "text": {"*": "<p>Hi</p>"},
+                    "categories": [],
+                    "images": list(MIXED_MEDIA),
+                }
+            }
+        )
+        mock_get.side_effect = [
+            _allpages((1, "P", T1)),
+            parse_resp,
+            _imageinfo("Song.ogg"),
+            _image_bytes(),
+        ]
+        _run_main(tmp_path, "--no-style", "--no-images", "--permit-file-types=*.ogg")
+
+        assert mock_get.call_args_list[2].kwargs["params"]["titles"] == "File:Song.ogg"
+        img_dir = tmp_path / "mywiki" / "static" / "images"
+        assert [p.name for p in img_dir.iterdir()] == ["Song.ogg"]
+
+    @pytest.mark.parametrize(
+        "name, images, files, globs, expected",
+        [
+            ("A b.PNG", True, True, ["*.ogg"], True),
+            ("A b.PNG", False, True, None, False),
+            ("clip.mp4", True, False, None, False),
+            ("clip.mp4", True, True, None, True),
+            ("clip.MP4", True, True, ["*.mp4"], True),
+            ("clip.mp4", True, True, ["*.m4v"], False),
+            ("Some trailer", True, True, ["*.ogg"], False),
+            ("Albert laugh.wav", True, True, ["albert_*"], True),
+        ],
+    )
+    def test_file_wanted(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        name: str,
+        images: bool,
+        files: bool,
+        globs: list[str] | None,
+        expected: bool,
+    ) -> None:
+        monkeypatch.setattr(scrape, "_download_images", images)
+        monkeypatch.setattr(scrape, "_download_files", files)
+        monkeypatch.setattr(scrape, "_permitted_file_types", globs)
+        assert scrape.file_wanted(name) is expected
 
 
 class TestWikitextOnly:
     """`--with-mediawiki --no-html --no-images --no-style` and its tracking modes."""
 
     def _out(self, tmp_path: Path) -> Path:
-        return tmp_path / "mywiki-mediawiki"
+        return tmp_path / "mywiki" / "mediawiki"
 
     @pytest.mark.parametrize("tracking", [[], ["--mediawiki-tracking", "db"]])
     @patch("scrape.verify_wiki_exists", return_value=True)
@@ -1167,8 +1248,8 @@ class TestWikitextOnly:
 
         f = self._out(tmp_path) / "Main_Page.1.mediawiki"
         assert f.read_text(encoding="utf-8") == "'''hi'''"
-        assert not (tmp_path / "static").exists()
-        conn = sqlite3.connect(tmp_path / "test.db")
+        assert not (tmp_path / "mywiki" / "static").exists()
+        conn = sqlite3.connect(tmp_path / "mywiki" / "mywiki.db")
         assert conn.execute("SELECT touched FROM wikitext_pages").fetchall() == [(T1,)]
         # The HTML table stays untouched
         assert conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0] == 0
@@ -1191,7 +1272,7 @@ class TestWikitextOnly:
         mock_get.side_effect = [allpages, _revisions((1, "A", "a"), (2, "B", "b"))]
         _run_main(tmp_path, *args)
 
-        assert not (tmp_path / "test.db").exists()
+        assert not (tmp_path / "mywiki" / "mywiki.db").exists()
         manifest = json.loads(
             (self._out(tmp_path) / "_index.json").read_text(encoding="utf-8")
         )
@@ -1227,7 +1308,7 @@ class TestWikitextOnly:
             _run_main(tmp_path, *args)
             assert mock_get.call_count == 2
 
-        assert not (tmp_path / "test.db").exists()
+        assert not (tmp_path / "mywiki" / "mywiki.db").exists()
         assert sorted(p.name for p in self._out(tmp_path).iterdir()) == [
             "A.1.mediawiki"
         ]
@@ -1269,3 +1350,46 @@ class TestWikitextOnly:
         _run_main(tmp_path, *ONLY_WIKITEXT)
         assert mock_get.call_args.kwargs["params"]["pageids"] == "2"
         assert (self._out(tmp_path) / "B.2.mediawiki").exists()
+
+
+class TestHiveLayout:
+    def test_paths(self, tmp_path: Path) -> None:
+        layout = scrape.hive_layout(str(tmp_path), "mywiki")
+        root = tmp_path / "mywiki"
+        assert layout.root == str(root)
+        assert layout.db == str(root / "mywiki.db")
+        assert layout.status == str(root / ".mywiki.status")
+        assert layout.static == str(root / "static")
+        assert layout.images == str(root / "static" / "images")
+        assert layout.theme == str(root / "static" / "theme.css")
+        assert layout.mediawiki == str(root / "mediawiki")
+
+    def test_default_hive_next_to_script(self) -> None:
+        here = os.path.dirname(os.path.abspath(scrape.__file__))
+        assert scrape.DEFAULT_HIVE == os.path.join(here, "hive")
+
+    @patch("scrape.verify_wiki_exists", return_value=True)
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_full_scrape_writes_only_inside_wiki_dir(
+        self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
+    ) -> None:
+        mock_get.side_effect = [
+            MagicMock(text=":root{}"),
+            _allpages((1, "P", T1)),
+            _revisions((1, "P", "x")),
+            _parse_with_pic(),
+            _imageinfo_pic(),
+            _image_bytes(),
+        ]
+        _run_main(tmp_path, "--with-mediawiki")
+
+        assert [p.name for p in tmp_path.iterdir()] == ["mywiki"]
+        assert sorted(
+            str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*") if p.is_file()
+        ) == [
+            "mywiki/mediawiki/P.1.mediawiki",
+            "mywiki/mywiki.db",
+            "mywiki/static/images/pic.png",
+            "mywiki/static/theme.css",
+        ]

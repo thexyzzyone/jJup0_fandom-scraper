@@ -32,14 +32,13 @@ def clean_env(tmp_path_factory: pytest.TempPathFactory) -> Path:
 @pytest.fixture(scope="module")
 def server_with_scraping(clean_env: Path) -> Generator[str, None, None]:
     """Start server that scrapes from scratch. Yields URL while scraping is in progress."""
-    db_path = str(clean_env / f"{WIKI}.db")
     proc = subprocess.Popen(
         [
             sys.executable,
             os.path.join(PROJECT_DIR, "server.py"),
             WIKI,
-            "--db",
-            db_path,
+            "--hive",
+            str(clean_env),
             "--port",
             str(PORT),
             "--log-level",
@@ -65,10 +64,15 @@ def server_with_scraping(clean_env: Path) -> Generator[str, None, None]:
 @pytest.fixture(scope="module")
 def scraped_server(clean_env: Path) -> Generator[str, None, None]:
     """Start server after full scrape is complete (--no-scrape)."""
-    db_path = str(clean_env / f"{WIKI}.db")
     # First scrape fully
     r = subprocess.run(
-        [sys.executable, os.path.join(PROJECT_DIR, "scrape.py"), WIKI, "--db", db_path],
+        [
+            sys.executable,
+            os.path.join(PROJECT_DIR, "scrape.py"),
+            WIKI,
+            "--hive",
+            str(clean_env),
+        ],
         cwd=str(clean_env),
         capture_output=True,
         text=True,
@@ -82,8 +86,8 @@ def scraped_server(clean_env: Path) -> Generator[str, None, None]:
             os.path.join(PROJECT_DIR, "server.py"),
             WIKI,
             "--no-scrape",
-            "--db",
-            db_path,
+            "--hive",
+            str(clean_env),
             "--port",
             str(port),
         ],
@@ -107,12 +111,12 @@ class TestScrapeFromScratch:
     """Test that scraping creates a valid DB and images."""
 
     def test_db_created(self, scraped_server: str, clean_env: Path) -> None:
-        db_path = clean_env / f"{WIKI}.db"
+        db_path = clean_env / WIKI / f"{WIKI}.db"
         assert db_path.exists()
         assert db_path.stat().st_size > 0
 
     def test_pages_in_db(self, scraped_server: str, clean_env: Path) -> None:
-        conn = sqlite3.connect(str(clean_env / f"{WIKI}.db"))
+        conn = sqlite3.connect(str(clean_env / WIKI / f"{WIKI}.db"))
         count = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
         conn.close()
         assert count >= 3
@@ -121,10 +125,10 @@ class TestScrapeFromScratch:
         self, scraped_server: str, clean_env: Path
     ) -> None:
         """#10: status file should be cleaned up when scraping is done."""
-        assert not (clean_env / f".{WIKI}.status").exists()
+        assert not (clean_env / WIKI / f".{WIKI}.status").exists()
 
     def test_theme_css_downloaded(self, scraped_server: str, clean_env: Path) -> None:
-        theme = Path(PROJECT_DIR) / "static" / WIKI / "theme.css"
+        theme = clean_env / WIKI / "static" / "theme.css"
         assert theme.exists()
         assert theme.stat().st_size > 0
 
@@ -195,7 +199,7 @@ class TestImageProxy:
     def test_proxy_fetches_real_image(
         self, scraped_server: str, clean_env: Path
     ) -> None:
-        conn = sqlite3.connect(str(clean_env / f"{WIKI}.db"))
+        conn = sqlite3.connect(str(clean_env / WIKI / f"{WIKI}.db"))
         rows = conn.execute("SELECT html FROM pages").fetchall()
         conn.close()
         name = None
@@ -216,7 +220,7 @@ class TestImageProxy:
         self, scraped_server: str, clean_env: Path
     ) -> None:
         """After proxy fetch, image should exist on disk."""
-        conn = sqlite3.connect(str(clean_env / f"{WIKI}.db"))
+        conn = sqlite3.connect(str(clean_env / WIKI / f"{WIKI}.db"))
         rows = conn.execute("SELECT html FROM pages").fetchall()
         conn.close()
         name = None
@@ -229,7 +233,7 @@ class TestImageProxy:
             pytest.skip("No image refs")
         safe = name.replace("/", "_").replace("\\", "_").replace(" ", "_")
         requests.get(f"{scraped_server}/image-proxy/{WIKI}/{name}")
-        img_path = Path(PROJECT_DIR) / "static" / WIKI / "images" / safe
+        img_path = clean_env / WIKI / "static" / "images" / safe
         assert img_path.exists()
 
 
@@ -254,21 +258,20 @@ class TestOnDemandPageFetch:
 
 class TestNonexistentWiki:
     def test_scrape_exits_with_error(self, tmp_path: Path) -> None:
-        db_path = str(tmp_path / "bad.db")
         r = subprocess.run(
             [
                 sys.executable,
                 os.path.join(PROJECT_DIR, "scrape.py"),
                 "zzznonexistentwiki999",
-                "--db",
-                db_path,
+                "--hive",
+                str(tmp_path),
             ],
             capture_output=True,
             text=True,
             timeout=30,
         )
         assert r.returncode != 0
-        assert not os.path.exists(db_path)
+        assert not any(tmp_path.iterdir())
 
     def test_server_exits_with_error(self) -> None:
         r = subprocess.run(

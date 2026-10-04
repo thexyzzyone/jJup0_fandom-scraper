@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import logging
 import os
@@ -13,7 +14,7 @@ import sys
 import time
 import urllib.parse
 from datetime import datetime, timezone
-from typing import Any, TypedDict
+from typing import Any, NamedTuple, TypedDict
 
 import requests
 
@@ -223,23 +224,71 @@ def get_page_images() -> set[str]:
         if "continue" not in data:
             break
         params.update(data["continue"])
-    log.info("found %d images used on content pages", len(names))
+    log.info("found %d images/files used on content pages", len(names))
     return names
 
 
-_static_dir: str | None = None
+DEFAULT_HIVE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hive")
 
 
-def _require_static_dir() -> str:
-    return _static_dir or os.path.join(os.path.dirname(__file__), "static")
+class HiveLayout(NamedTuple):
+    """Where everything for one wiki lives: <hive>/<wiki>/... (see hive/AGENTS.md)."""
+
+    root: str
+    db: str
+    status: str
+    static: str
+    images: str
+    theme: str
+    mediawiki: str
+
+
+def hive_layout(hive: str, wiki: str) -> HiveLayout:
+    root = os.path.join(hive, wiki)
+    static = os.path.join(root, "static")
+    return HiveLayout(
+        root=root,
+        db=os.path.join(root, f"{wiki}.db"),
+        status=os.path.join(root, f".{wiki}.status"),
+        static=static,
+        images=os.path.join(static, "images"),
+        theme=os.path.join(static, "theme.css"),
+        mediawiki=os.path.join(root, "mediawiki"),
+    )
+
+
+_images_dir: str | None = None
+# Which wiki uploads to download. "Images" are picked out by extension; every
+# other upload (audio, video, fonts, ...) is a "file".
+IMAGE_EXTENSIONS = frozenset(
+    "apng avif bmp gif ico jpeg jpg png svg tif tiff webp".split()
+)
+_download_images: bool = True
+_download_files: bool = True
+_permitted_file_types: list[str] | None = None  # lowercase globs; None = all
+
+
+def _require_images_dir() -> str:
+    assert _images_dir is not None, "_images_dir must be set first"
+    return _images_dir
+
+
+def file_wanted(filename: str) -> bool:
+    """Whether --no-images / --prohibit-files / --permit-file-types allow it."""
+    name = filename.replace(" ", "_").lower()
+    if os.path.splitext(name)[1].lstrip(".") in IMAGE_EXTENSIONS:
+        return _download_images
+    if not _download_files:
+        return False
+    if _permitted_file_types is None:
+        return True
+    return any(fnmatch.fnmatchcase(name, pat) for pat in _permitted_file_types)
 
 
 def download_image(url: str, filename: str) -> str:
-    """Download image to static/images/, return local relative path."""
+    """Download image into the wiki's images dir, return its local name."""
     safe_name = filename.replace("/", "_").replace("\\", "_").replace(" ", "_")
-    local_path = os.path.join(
-        _require_static_dir(), _require_wiki_name(), "images", safe_name
-    )
+    local_path = os.path.join(_require_images_dir(), safe_name)
     if os.path.exists(local_path):
         return safe_name
     log.info("downloading %s", filename)
@@ -414,6 +463,13 @@ def scrape_wikitext(
 
 def download_missing_images(filenames: set[str], img_dir: str) -> dict[str, str]:
     """Download images not yet in img_dir; return {remote url: local name}."""
+    wanted = {f for f in filenames if file_wanted(f)}
+    if len(wanted) < len(filenames):
+        log.info(
+            "Skipping %d images/files excluded by the download flags",
+            len(filenames) - len(wanted),
+        )
+    filenames = wanted
     local_files = set(os.listdir(img_dir))
     needed = [
         f
@@ -442,9 +498,13 @@ def download_missing_images(filenames: set[str], img_dir: str) -> dict[str, str]
 
 
 def scrape_html(
-    pages: list[PageInfo], db_path: str, img_dir: str, with_images: bool
+    pages: list[PageInfo], db_path: str, img_dir: str, with_media: bool
 ) -> None:
-    """Store rendered HTML of new/changed pages in the DB, plus their images."""
+    """Store rendered HTML of new/changed pages in the DB, plus their media.
+
+    `with_media` turns image/file downloads on at all; file_wanted() then
+    decides each one.
+    """
     conn = init_db(db_path)
     c = conn.cursor()
 
@@ -462,7 +522,7 @@ def scrape_html(
 
     stale = find_stale(pages, existing)
 
-    local_files: set[str] = set(os.listdir(img_dir)) if with_images else set()
+    local_files: set[str] = set(os.listdir(img_dir)) if with_media else set()
 
     for i, page in enumerate(stale):
         log.info("[%d/%d] %s", i + 1, len(stale), page["title"])
@@ -477,8 +537,9 @@ def scrape_html(
             for f in parsed["images"]
             if f.replace("/", "_").replace("\\", "_").replace(" ", "_")
             not in local_files
+            and file_wanted(f)
         ]
-        if needed and with_images:
+        if needed and with_media:
             image_urls = get_image_urls(needed)
             image_map: dict[str, str] = {}
             for fname, url in image_urls.items():
@@ -510,7 +571,7 @@ def scrape_html(
 
     conn.commit()
 
-    if with_images:
+    if with_media:
         # Signal: pages done, images phase starting (#10)
         with open(status_path, "w") as f:
             f.write("images")
@@ -546,16 +607,16 @@ def main() -> None:
     parser.add_argument(
         "wiki", help="Wiki subdomain (e.g. spiritfarer, hollowknight, stardewvalley)"
     )
-    parser.add_argument("--db", default=None, help="Database path (default: <wiki>.db)")
     parser.add_argument(
-        "--static-dir",
-        default=None,
-        help="Static files directory (default: static/ next to script)",
+        "--hive",
+        default=DEFAULT_HIVE,
+        help="Output root; everything goes in <hive>/<wiki>/ (default: hive/ next "
+        "to this script)",
     )
     parser.add_argument(
         "--with-mediawiki",
         action="store_true",
-        help="Also save raw wikitext to <wiki>-mediawiki/<Title>.<pageid>.mediawiki",
+        help="Also save raw wikitext to <hive>/<wiki>/mediawiki/<Title>.<pageid>.mediawiki",
     )
     parser.add_argument(
         "--mediawiki-tracking",
@@ -563,7 +624,7 @@ def main() -> None:
         default=None,
         help="With --with-mediawiki: where to remember each page's last-seen "
         "revision so reruns only fetch changes. db = table in <wiki>.db "
-        "(default), manifest = <wiki>-mediawiki/_index.json, "
+        "(default), manifest = mediawiki/_index.json, "
         "none = refetch every page every run",
     )
     parser.add_argument(
@@ -572,7 +633,23 @@ def main() -> None:
         help="Don't store rendered HTML (the result can't be served by server.py)",
     )
     parser.add_argument(
-        "--no-images", action="store_true", help="Don't download images"
+        "--no-images",
+        action="store_true",
+        help="Don't download images (png, jpg, gif, webp, svg, ...)",
+    )
+    files = parser.add_mutually_exclusive_group()
+    files.add_argument(
+        "--prohibit-files",
+        action="store_true",
+        help="Don't download non-image files (audio, video, fonts, ...)",
+    )
+    files.add_argument(
+        "--permit-file-types",
+        metavar="GLOBS",
+        default=None,
+        help="Only download non-image files whose names match one of these "
+        "comma-separated, case-insensitive globs, e.g. '*.ogg,*.m4v'. "
+        "An empty list is the same as --prohibit-files",
     )
     parser.add_argument(
         "--no-style",
@@ -581,54 +658,60 @@ def main() -> None:
     )
     args = parser.parse_args()
     with_html: bool = not args.no_html
+    permitted: list[str] | None = None
+    if args.permit_file_types is not None:
+        permitted = [
+            p.strip().lower() for p in args.permit_file_types.split(",") if p.strip()
+        ]
     with_images: bool = not args.no_images
+    with_files: bool = not (args.prohibit_files or permitted == [])
+    with_media: bool = with_images or with_files
     with_style: bool = not args.no_style
     if args.mediawiki_tracking and not args.with_mediawiki:
         parser.error("--mediawiki-tracking requires --with-mediawiki")
-    if not (with_html or with_images or with_style or args.with_mediawiki):
+    if not (with_html or with_media or with_style or args.with_mediawiki):
         parser.error("nothing to scrape: every kind of content is disabled")
 
     init_wiki(args.wiki)
-    global _static_dir
-    _static_dir = args.static_dir
+    layout = hive_layout(args.hive, args.wiki)
+    global _images_dir, _download_images, _download_files, _permitted_file_types
+    _images_dir = layout.images
+    _download_images = with_images
+    _download_files = with_files
+    _permitted_file_types = permitted
 
     log.info("Verifying wiki '%s' exists...", args.wiki)
     if not verify_wiki_exists():
         log.error("Wiki '%s' does not exist on Fandom. Aborting.", args.wiki)
         sys.exit(1)
 
-    db_path: str = args.db or os.path.join(os.path.dirname(__file__), f"{args.wiki}.db")
-    img_dir = os.path.join(_require_static_dir(), args.wiki, "images")
-    if with_images:
-        os.makedirs(img_dir, exist_ok=True)
+    os.makedirs(layout.root, exist_ok=True)
+    if with_media:
+        os.makedirs(layout.images, exist_ok=True)
 
     if with_style:
         # Download theme variables (not behind Cloudflare)
         theme_url = f"https://{args.wiki}.fandom.com/wikia.php?controller=ThemeApi&method=themeVariables"
         log.info("Downloading theme variables from %s...", theme_url)
         theme_css = SESSION.get(theme_url).text
-        theme_path = os.path.join(_require_static_dir(), args.wiki, "theme.css")
-        os.makedirs(os.path.dirname(theme_path), exist_ok=True)
-        with open(theme_path, "w") as f:
+        os.makedirs(layout.static, exist_ok=True)
+        with open(layout.theme, "w") as f:
             f.write(theme_css)
-        log.info("Saved to static/%s/theme.css", args.wiki)
+        log.info("Saved to %s", layout.theme)
 
     pages = get_all_pages() if with_html or args.with_mediawiki else []
 
     # Wikitext first: 50 pages per request, so it's done long before the HTML
     if args.with_mediawiki:
         scrape_wikitext(
-            pages,
-            os.path.join(os.path.dirname(db_path), f"{args.wiki}-mediawiki"),
-            args.mediawiki_tracking or "db",
-            db_path,
+            pages, layout.mediawiki, args.mediawiki_tracking or "db", layout.db
         )
 
     if with_html:
-        scrape_html(pages, db_path, img_dir, with_images)
-    elif with_images:
+        scrape_html(pages, layout.db, layout.images, with_media)
+    elif with_media:
         # No HTML to read image names from, so ask the API what pages use
-        download_missing_images(get_page_images(), img_dir)
+        download_missing_images(get_page_images(), layout.images)
 
     log.info("Done!")
 

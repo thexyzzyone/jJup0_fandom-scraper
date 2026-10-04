@@ -23,13 +23,17 @@ from flask import (
     render_template,
     request,
     send_file,
+    send_from_directory,
 )
 
 log = logging.getLogger("server")
-app: Flask = Flask(__name__)
+# /static/ is routed by static_files() below, not Flask's built-in handler
+app: Flask = Flask(__name__, static_folder=None)
+SHARED_STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 _db_path: str | None = None
 _wiki_name: str | None = None
 _status_path: str | None = None
+_wiki_static: str | None = None  # <hive>/<wiki>/static
 
 
 def _scrape_status() -> str | None:
@@ -145,6 +149,15 @@ def api_search() -> Response:
     return jsonify(results)
 
 
+@app.route("/static/<path:filename>")
+def static_files(filename: str) -> Response:
+    """/static/<wiki>/... from the wiki's hive dir; anything else is shared."""
+    prefix = f"{app.config.get('WIKI_SLUG', '')}/"
+    if _wiki_static and filename.startswith(prefix):
+        return send_from_directory(_wiki_static, filename[len(prefix) :])
+    return send_from_directory(SHARED_STATIC, filename)
+
+
 @app.route("/wiki/<path:title>")
 def page(title: str) -> str | tuple[str, int] | Response:
     db = get_db()
@@ -209,8 +222,12 @@ def page(title: str) -> str | tuple[str, int] | Response:
 @app.route("/image-proxy/<wiki>/<path:filename>")
 def image_proxy(wiki: str, filename: str) -> Response | tuple[str, int]:
     """Fetch missing image from remote, cache locally, and serve it (#5)."""
+    # Only the wiki being served has a cache dir; this also keeps `wiki` from
+    # steering the cache path anywhere else
+    if wiki != app.config.get("WIKI_SLUG") or not _wiki_static:
+        return "Unknown wiki", 404
     safe_name = filename.replace("/", "_").replace("\\", "_").replace(" ", "_")
-    local_path = os.path.join(app.static_folder or "", wiki, "images", safe_name)
+    local_path = os.path.join(_wiki_static, "images", safe_name)
     if os.path.exists(local_path):
         return send_file(local_path)
     # Resolve URL via MediaWiki API
@@ -253,15 +270,15 @@ def image_proxy(wiki: str, filename: str) -> Response | tuple[str, int]:
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("wiki", help="Wiki name (e.g. spiritfarer)")
-    p.add_argument("--db", default=None, help="Database path (default: <wiki>.db)")
+    p.add_argument(
+        "--hive",
+        default=None,
+        help="Data root; the wiki is read from <hive>/<wiki>/ (default: hive/ next "
+        "to this script)",
+    )
     p.add_argument("--no-scrape", action="store_true", help="Skip scraping, just serve")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=5000)
-    p.add_argument(
-        "--static-dir",
-        default=None,
-        help="Static files directory (default: static/ next to script)",
-    )
     p.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
@@ -273,11 +290,14 @@ if __name__ == "__main__":
         level=getattr(logging, args.log_level),
     )
 
-    _db_path = args.db or os.path.join(os.path.dirname(__file__), f"{args.wiki}.db")
-    _status_path = os.path.join(os.path.dirname(_db_path), f".{args.wiki}.status")
+    # Imported after logging is configured: scrape sets up logging on import
+    from scrape import DEFAULT_HIVE, hive_layout
 
-    if args.static_dir:
-        app.static_folder = os.path.abspath(args.static_dir)
+    hive: str = args.hive or DEFAULT_HIVE
+    layout = hive_layout(hive, args.wiki)
+    _db_path = layout.db
+    _status_path = layout.status
+    _wiki_static = layout.static
 
     if not args.no_scrape:
         from scrape import init_wiki, verify_wiki_exists
@@ -292,18 +312,18 @@ if __name__ == "__main__":
                 sys.executable,
                 os.path.join(os.path.dirname(__file__), "scrape.py"),
                 args.wiki,
+                "--hive",
+                hive,
             ]
-            if args.db:
-                cmd += ["--db", args.db]
-            if args.static_dir:
-                cmd += ["--static-dir", args.static_dir]
             subprocess.run(cmd)
 
+        # Exists before the first request, even while the scraper starts up
+        os.makedirs(layout.root, exist_ok=True)
         log.info("Scraping %s in background...", args.wiki)
         threading.Thread(target=_scrape, daemon=True).start()
 
     _wiki_name = args.wiki.replace("-", " ").title()
-    css_path = os.path.join(app.static_folder or "", "fandom-all.css")
+    css_path = os.path.join(SHARED_STATIC, "fandom-all.css")
     has_full_css = os.path.exists(css_path) and os.path.getsize(css_path) > 5000
     if not has_full_css:
         log.warning("Full Fandom CSS not found — using fallback styles.")

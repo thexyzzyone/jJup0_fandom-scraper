@@ -68,6 +68,7 @@ def db_path(tmp_path: Path) -> str:
 def client(db_path: str) -> Generator[FlaskClient, None, None]:
     server._db_path = db_path
     server._wiki_name = "Test Wiki"
+    server._wiki_static = None
     server.app.config["TESTING"] = True
     server.app.config["HAS_FULL_CSS"] = False
     server.app.config["WIKI_SLUG"] = "testwiki"

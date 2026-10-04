@@ -30,31 +30,57 @@ python scrape.py spiritfarer
 python server.py spiritfarer --no-scrape
 ```
 
-Each wiki gets its own database (`<wiki>.db`) and asset directory (`static/<wiki>/`).
+All output goes in `hive/`, one folder per wiki named after its subdomain:
+
+```
+hive/
+  AGENTS.md                Layout guide for AI agents (committed)
+  spiritfarer/
+    spiritfarer.db         Pages + full-text index
+    mediawiki/             Raw wikitext (--with-mediawiki)
+    static/
+      theme.css            Per-wiki colors and fonts
+      images/              Images and other uploads
+```
+
+`hive/` is committed empty apart from its `.gitignore` and [`hive/AGENTS.md`](hive/AGENTS.md), which explains the layout, database schema and useful queries so an AI agent can use a scraped wiki as a knowledge base. Pass `--hive <dir>` to `scrape.py` or `server.py` to put it somewhere else.
+
+Upgrading from the old layout (`<wiki>.db` in the repo root, `static/<wiki>/`): move `<wiki>.db` and any `.<wiki>.status` to `hive/<wiki>/`, and `static/<wiki>/` to `hive/<wiki>/static/`. Page links and image URLs in the database don't change.
 
 ### Choosing what to scrape
 
-By default the scraper stores rendered HTML (with its search index), downloads images, and downloads the wiki's theme CSS. These flags change that, and any combination is allowed:
+By default the scraper stores rendered HTML (with its search index), downloads every image and other file used on article pages, and downloads the wiki's theme CSS. These flags change that, and any combination is allowed except `--prohibit-files` with `--permit-file-types`:
 
 | Flag | Effect |
 |---|---|
-| `--with-mediawiki` | Also save each page's raw wikitext to `<wiki>-mediawiki/<Title>.<pageid>.mediawiki` |
+| `--with-mediawiki` | Also save each page's raw wikitext to `hive/<wiki>/mediawiki/<Title>.<pageid>.mediawiki` |
 | `--no-html` | Don't store rendered HTML. `server.py` has nothing to serve from this database. |
 | `--no-images` | Don't download images. Stored HTML keeps pointing at Fandom's servers, so images only load while you're online. |
-| `--no-style` | Don't download theme CSS (`static/<wiki>/theme.css`) |
+| `--prohibit-files` | Don't download non-image files (audio, video, fonts, documents, ...) |
+| `--permit-file-types='*.ogg,*.m4v'` | Only download non-image files whose names match one of these comma-separated globs. An empty list is the same as `--prohibit-files`. |
+| `--no-style` | Don't download theme CSS (`hive/<wiki>/static/theme.css`) |
 
 ```bash
 # Everything, plus wikitext files
 python scrape.py spiritfarer --with-mediawiki
 
 # Searchable text with no media
-python scrape.py spiritfarer --no-images --no-style
+python scrape.py spiritfarer --no-images --prohibit-files --no-style
+
+# Images plus OGG audio, nothing else
+python scrape.py spiritfarer --permit-file-types='*.ogg'
 
 # Wikitext files only
-python scrape.py spiritfarer --with-mediawiki --no-html --no-images --no-style
+python scrape.py spiritfarer --with-mediawiki --no-html --no-images --prohibit-files --no-style
 ```
 
-Turning everything off is an error. A later run without `--no-images` downloads the missing images and switches stored pages to the local copies. With `--no-html`, images are still downloaded (unless `--no-images` is also given): the scraper asks the API for every image used on an article page, which is the same set a normal scrape downloads.
+Turning everything off is an error. A later run with fewer restrictions downloads whatever was skipped and switches stored pages to the local copies. With `--no-html`, images and files are still downloaded unless their flags say otherwise: the scraper asks the API for every upload used on an article page, which is the same set a normal scrape downloads.
+
+#### Images and files
+
+Wikis upload more than pictures: audio (e.g. `.wav`, `.ogg`), video (`.mp4`), fonts and documents all appear on article pages. An upload counts as an **image** if its extension is one of `apng avif bmp gif ico jpeg jpg png svg tif tiff webp`; everything else, including extensionless entries such as embedded YouTube videos, is a **file**. `--no-images` controls images only; `--prohibit-files` and `--permit-file-types` control files only, so `--permit-file-types` can't exclude images.
+
+`--permit-file-types` globs use `*` and `?`, are case-insensitive, and are matched against the saved filename (spaces become underscores), so `--permit-file-types='*.ogg,Albert_*'` also works. Quote the list: zsh otherwise tries to expand the `*` itself and fails with "no matches found". Files already downloaded by an earlier run are kept even if a later run excludes them.
 
 #### Wikitext files
 
@@ -65,7 +91,7 @@ Each `.mediawiki` file is the page's source exactly as stored on the wiki. Filen
 | `--mediawiki-tracking` | Bookkeeping | Reruns |
 |---|---|---|
 | `db` (default) | `wikitext_pages` table in `<wiki>.db` (pageid, title, timestamp; never the page text) | Fetch only new or changed pages |
-| `manifest` | `<wiki>-mediawiki/_index.json` | Fetch only new or changed pages |
+| `manifest` | `hive/<wiki>/mediawiki/_index.json` | Fetch only new or changed pages |
 | `none` | Nothing | Fetch every page again |
 
 With `--no-html`, a `manifest` or `none` run creates no database at all. Wikitext is fetched 50 pages per request, so even `none` is fast compared with an HTML scrape.
@@ -93,7 +119,7 @@ await Promise.all(
 
 1. Move the downloaded file to `static/fandom-all.css`
 
-This only needs to be done once — the CSS is shared across all wikis. Per-wiki theming comes from `static/<wiki>/theme.css` which the scraper downloads automatically.
+This only needs to be done once — the CSS is shared across all wikis. Per-wiki theming comes from `hive/<wiki>/static/theme.css`, which the scraper downloads automatically.
 
 Without this step, the built-in fallback CSS handles infoboxes, tables, tabs, and galleries — just not pixel-perfect. The server will show a warning banner when the full CSS is missing.
 
@@ -104,11 +130,14 @@ scrape.py                  MediaWiki API scraper → SQLite + local images
 server.py                  Flask web server with FTS5 search
 static/
   fandom-all.css           Fandom's layout CSS (extracted from browser, shared across wikis)
+hive/                      All scraped data (contents git-ignored)
+  AGENTS.md                Layout guide for AI agents
   <wiki>/
-    theme.css              Per-wiki theme variables (auto-downloaded by scraper)
-    images/                Wiki images, named by original filename
-<wiki>.db                  SQLite database per wiki (pages + FTS5 index)
-<wiki>-mediawiki/          Raw wikitext files (--with-mediawiki)
+    <wiki>.db              SQLite database per wiki (pages + FTS5 index)
+    mediawiki/             Raw wikitext files (--with-mediawiki)
+    static/
+      theme.css            Per-wiki theme variables (auto-downloaded by scraper)
+      images/              Wiki images and other uploads, named by original filename
 templates/
   index.html               Search/browse page
   page.html                Wiki page viewer
@@ -116,7 +145,7 @@ templates/
 
 ### CSS Load Order
 
-1. `static/<wiki>/theme.css` — per-wiki CSS variables (colors, fonts, background image)
+1. `hive/<wiki>/static/theme.css` (served as `/static/<wiki>/theme.css`) — per-wiki CSS variables (colors, fonts, background image)
 2. `static/fandom-all.css` — shared Fandom layout CSS
 3. Inline fallback CSS — covers infoboxes, tables, tabs, galleries when full CSS is missing
 
@@ -129,14 +158,14 @@ Uses the MediaWiki API exclusively — no HTML scraping or browser automation.
 1. `action=query&list=allpages` — enumerate all content pages
 2. `action=parse&prop=text|categories|images` — rendered HTML per page
 3. `action=query&prop=imageinfo&iiprop=url` — batch-resolve image URLs (50 at a time)
-4. Download images to `static/<wiki>/images/`
+4. Download images to `hive/<wiki>/static/images/`
 5. Rewrite HTML: remote image URLs → local paths, wiki links → local routes
 6. Store in SQLite with FTS5 triggers for automatic search indexing
 7. `wikia.php?controller=ThemeApi&method=themeVariables` — download theme CSS
 
 Rate limited to 0.5s between requests. Resumable — skips already-scraped pages and existing images.
 
-`--no-images` skips steps 3 and 4, `--no-style` skips step 7, and `--no-html` skips steps 2 and 5–6 (images then come from `action=query&generator=allpages&prop=images`). `--with-mediawiki` adds `action=query&prop=revisions&rvprop=content&rvslots=main`, 50 pageids per request.
+`--no-images` and the file flags limit which uploads steps 3 and 4 fetch (skipping them entirely when both kinds are off), `--no-style` skips step 7, and `--no-html` skips steps 2 and 5–6 (images then come from `action=query&generator=allpages&prop=images`). `--with-mediawiki` adds `action=query&prop=revisions&rvprop=content&rvslots=main`, 50 pageids per request.
 
 ### Search
 
@@ -145,7 +174,7 @@ SQLite FTS5 with prefix matching (`word*`). Live search via `/api/search` JSON e
 ### Serving
 
 ```
-python server.py <wiki> [--no-scrape] [--host 0.0.0.0] [--port 5000]
+python server.py <wiki> [--no-scrape] [--hive DIR] [--host 0.0.0.0] [--port 5000]
 ```
 
 - `/` — search/browse all pages
