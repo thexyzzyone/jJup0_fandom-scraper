@@ -1,5 +1,6 @@
 *.db
 *.db-journal
+*-mediawiki/
 static/*/
 __pycache__/
 *.pyc
@@ -8,3 +9,6 @@ __pycache__/
 .pytest_cache/
 temp/
 test-artifacts/
+.*.status
+.venv/
+.mypy_cache/

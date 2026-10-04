@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -869,3 +870,402 @@ class TestMainIntegration:
         # HTML should have local path, not remote URL
         assert "/static/mywiki/images/pic.png" in html
         assert "static.wikia.nocookie.net" not in html
+
+
+# ---------------------------------------------------------------------------
+# --with-mediawiki / --no-html / --no-images / --no-style
+# ---------------------------------------------------------------------------
+T1 = "2024-01-01T00:00:00Z"
+T2 = "2024-06-01T00:00:00Z"
+REMOTE_PIC = "https://static.wikia.nocookie.net/mywiki/pic.png"
+ONLY_WIKITEXT = ["--with-mediawiki", "--no-html", "--no-images", "--no-style"]
+
+
+def _allpages(*pages: tuple[int, str, str]) -> MagicMock:
+    return _mock_resp(
+        {
+            "query": {
+                "pages": {
+                    str(pid): {"pageid": pid, "title": title, "touched": touched}
+                    for pid, title, touched in pages
+                }
+            }
+        }
+    )
+
+
+def _revisions(*pages: tuple[int, str, str]) -> MagicMock:
+    return _mock_resp(
+        {
+            "query": {
+                "pages": {
+                    str(pid): {
+                        "pageid": pid,
+                        "title": title,
+                        "revisions": [{"slots": {"main": {"*": text}}}],
+                    }
+                    for pid, title, text in pages
+                }
+            }
+        }
+    )
+
+
+def _parse_with_pic() -> MagicMock:
+    return _mock_resp(
+        {
+            "parse": {
+                "text": {
+                    "*": f'<p>Hi</p><img data-src="{REMOTE_PIC}" data-image-key="pic.png">'
+                },
+                "categories": [],
+                "images": ["pic.png"],
+            }
+        }
+    )
+
+
+def _imageinfo_pic() -> MagicMock:
+    return _mock_resp(
+        {
+            "query": {
+                "pages": {
+                    "-1": {"title": "File:pic.png", "imageinfo": [{"url": REMOTE_PIC}]}
+                }
+            }
+        }
+    )
+
+
+def _image_bytes() -> MagicMock:
+    return MagicMock(iter_content=MagicMock(return_value=[b"PNG"]))
+
+
+def _run_main(tmp_path: Path, *extra: str) -> None:
+    orig_dirname = os.path.dirname
+    fake_dirname = lambda p: (
+        str(tmp_path) if p == scrape.__file__ else orig_dirname(p)
+    )
+    argv = ["scrape.py", "mywiki", "--db", str(tmp_path / "test.db"), *extra]
+    with patch("scrape.os.path.dirname", side_effect=fake_dirname):
+        with patch("sys.argv", argv):
+            scrape.main()
+
+
+class TestWikitextFilename:
+    @pytest.mark.parametrize(
+        "title, expected",
+        [
+            ("Main Page", "Main_Page.1.mediawiki"),
+            ("AC/DC", "AC%2FDC.1.mediawiki"),
+            ("Foo: Bar", "Foo%3A_Bar.1.mediawiki"),
+            ("100%", "100%25.1.mediawiki"),
+            ("Über Page", "Über_Page.1.mediawiki"),
+        ],
+    )
+    def test_sanitizes(self, title: str, expected: str) -> None:
+        assert scrape.wikitext_filename(1, title) == expected
+
+    def test_case_variants_do_not_collide(self) -> None:
+        a = scrape.wikitext_filename(1, "Foo Bar")
+        b = scrape.wikitext_filename(2, "Foo bar")
+        assert a.lower() != b.lower()
+
+    def test_long_title_fits_filename_limit(self) -> None:
+        name = scrape.wikitext_filename(123456789, "é" * 255)
+        assert len(name.encode()) <= 255
+        assert name.endswith(".123456789.mediawiki")
+
+
+class TestGetWikitext:
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_batches_by_50(self, mock_get: MagicMock) -> None:
+        scrape.init_wiki("testwiki")
+        mock_get.return_value = _revisions()
+        scrape.get_wikitext(list(range(1, 121)))
+        assert mock_get.call_count == 3
+
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_skips_missing_and_hidden(self, mock_get: MagicMock) -> None:
+        scrape.init_wiki("testwiki")
+        mock_get.return_value = _mock_resp(
+            {
+                "query": {
+                    "pages": {
+                        "1": {
+                            "pageid": 1,
+                            "revisions": [{"slots": {"main": {"*": "ok"}}}],
+                        },
+                        "2": {"pageid": 2, "missing": ""},
+                        "3": {
+                            "pageid": 3,
+                            "revisions": [{"slots": {"main": {"texthidden": ""}}}],
+                        },
+                    }
+                }
+            }
+        )
+        assert scrape.get_wikitext([1, 2, 3]) == {1: "ok"}
+
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_follows_continue(self, mock_get: MagicMock) -> None:
+        scrape.init_wiki("testwiki")
+        first = _revisions((1, "A", "a"))
+        first.json.return_value["continue"] = {"rvcontinue": "2|0"}
+        mock_get.side_effect = [first, _revisions((2, "B", "b"))]
+        assert scrape.get_wikitext([1, 2]) == {1: "a", 2: "b"}
+
+
+class TestGetPageImages:
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_collects_across_pages_and_continuations(self, mock_get: MagicMock) -> None:
+        scrape.init_wiki("testwiki")
+        first = _mock_resp(
+            {
+                "continue": {"imcontinue": "1|B.png"},
+                "query": {
+                    "pages": {
+                        "1": {"images": [{"title": "File:A pic.png"}]},
+                        "2": {},
+                    }
+                },
+            }
+        )
+        second = _mock_resp(
+            {
+                "query": {
+                    "pages": {
+                        "1": {"images": [{"title": "File:B.png"}]},
+                        "2": {"images": [{"title": "Datei:A pic.png"}]},
+                    }
+                }
+            }
+        )
+        mock_get.side_effect = [first, second]
+        assert scrape.get_page_images() == {"A pic.png", "B.png"}
+        assert mock_get.call_args.kwargs["params"]["imcontinue"] == "1|B.png"
+
+
+class TestContentFlags:
+    @patch("scrape.verify_wiki_exists", return_value=True)
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_no_images(
+        self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
+    ) -> None:
+        theme = MagicMock(text=":root{}")
+        # theme + allpages + parse: no imageinfo or image download requests
+        mock_get.side_effect = [theme, _allpages((1, "P", T1)), _parse_with_pic()]
+        _run_main(tmp_path, "--no-images")
+
+        assert mock_get.call_count == 3
+        assert (tmp_path / "static" / "mywiki" / "theme.css").exists()
+        assert not (tmp_path / "static" / "mywiki" / "images").exists()
+        assert not (tmp_path / ".mywiki.status").exists()
+        conn = sqlite3.connect(tmp_path / "test.db")
+        html = conn.execute("SELECT html FROM pages WHERE pageid=1").fetchone()[0]
+        conn.close()
+        assert f'src="{REMOTE_PIC}"' in html
+
+    @patch("scrape.verify_wiki_exists", return_value=True)
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_no_style(
+        self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
+    ) -> None:
+        # No theme request; HTML and images as usual
+        mock_get.side_effect = [
+            _allpages((1, "P", T1)),
+            _parse_with_pic(),
+            _imageinfo_pic(),
+            _image_bytes(),
+        ]
+        _run_main(tmp_path, "--no-style")
+
+        assert not (tmp_path / "static" / "mywiki" / "theme.css").exists()
+        assert (tmp_path / "static" / "mywiki" / "images" / "pic.png").exists()
+        conn = sqlite3.connect(tmp_path / "test.db")
+        html = conn.execute("SELECT html FROM pages WHERE pageid=1").fetchone()[0]
+        conn.close()
+        assert "/static/mywiki/images/pic.png" in html
+
+    @patch("scrape.verify_wiki_exists", return_value=True)
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_no_html_still_downloads_images(
+        self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
+    ) -> None:
+        page_images = _mock_resp(
+            {"query": {"pages": {"1": {"images": [{"title": "File:pic.png"}]}}}}
+        )
+        # No allpages/parse: image names come from prop=images instead
+        mock_get.side_effect = [page_images, _imageinfo_pic(), _image_bytes()]
+        _run_main(tmp_path, "--no-html", "--no-style")
+
+        assert mock_get.call_count == 3
+        assert (tmp_path / "static" / "mywiki" / "images" / "pic.png").exists()
+        assert not (tmp_path / "test.db").exists()
+
+    @patch("scrape.verify_wiki_exists", return_value=True)
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_with_mediawiki_alongside_full_scrape(
+        self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
+    ) -> None:
+        mock_get.side_effect = [
+            MagicMock(text=":root{}"),
+            _allpages((1, "P", T1)),  # enumerated once, shared by both phases
+            _revisions((1, "P", "'''hi'''")),
+            _parse_with_pic(),
+            _imageinfo_pic(),
+            _image_bytes(),
+        ]
+        _run_main(tmp_path, "--with-mediawiki")
+
+        assert mock_get.call_count == 6
+        out = tmp_path / "mywiki-mediawiki" / "P.1.mediawiki"
+        assert out.read_text(encoding="utf-8") == "'''hi'''"
+        assert (tmp_path / "static" / "mywiki" / "images" / "pic.png").exists()
+        conn = sqlite3.connect(tmp_path / "test.db")
+        assert conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM wikitext_pages").fetchone()[0] == 1
+        conn.close()
+
+    def test_mediawiki_tracking_requires_with_mediawiki(self, tmp_path: Path) -> None:
+        with pytest.raises(SystemExit):
+            _run_main(tmp_path, "--mediawiki-tracking", "manifest")
+
+    def test_everything_disabled_is_an_error(self, tmp_path: Path) -> None:
+        with pytest.raises(SystemExit):
+            _run_main(tmp_path, "--no-html", "--no-images", "--no-style")
+
+
+class TestWikitextOnly:
+    """`--with-mediawiki --no-html --no-images --no-style` and its tracking modes."""
+
+    def _out(self, tmp_path: Path) -> Path:
+        return tmp_path / "mywiki-mediawiki"
+
+    @pytest.mark.parametrize("tracking", [[], ["--mediawiki-tracking", "db"]])
+    @patch("scrape.verify_wiki_exists", return_value=True)
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_db_tracking(
+        self,
+        mock_get: MagicMock,
+        mock_verify: MagicMock,
+        tmp_path: Path,
+        tracking: list[str],
+    ) -> None:
+        allpages = _allpages((1, "Main Page", T1))
+        mock_get.side_effect = [allpages, _revisions((1, "Main Page", "'''hi'''"))]
+        _run_main(tmp_path, *ONLY_WIKITEXT, *tracking)
+
+        f = self._out(tmp_path) / "Main_Page.1.mediawiki"
+        assert f.read_text(encoding="utf-8") == "'''hi'''"
+        assert not (tmp_path / "static").exists()
+        conn = sqlite3.connect(tmp_path / "test.db")
+        assert conn.execute("SELECT touched FROM wikitext_pages").fetchall() == [(T1,)]
+        # The HTML table stays untouched
+        assert conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0] == 0
+        conn.close()
+
+        # Rerun with nothing changed: only the allpages request
+        mock_get.reset_mock()
+        mock_get.side_effect = [allpages]
+        _run_main(tmp_path, *ONLY_WIKITEXT, *tracking)
+        assert mock_get.call_count == 1
+
+    @patch("scrape.verify_wiki_exists", return_value=True)
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_manifest_tracking(
+        self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
+    ) -> None:
+        args = [*ONLY_WIKITEXT, "--mediawiki-tracking", "manifest"]
+        allpages = _allpages((1, "A", T1), (2, "B", T1))
+        mock_get.side_effect = [allpages, _revisions((1, "A", "a"), (2, "B", "b"))]
+        _run_main(tmp_path, *args)
+
+        assert not (tmp_path / "test.db").exists()
+        manifest = json.loads(
+            (self._out(tmp_path) / "_index.json").read_text(encoding="utf-8")
+        )
+        assert manifest == {
+            "1": {"title": "A", "touched": T1},
+            "2": {"title": "B", "touched": T1},
+        }
+
+        # Page 2 changed: only it is refetched
+        mock_get.reset_mock()
+        mock_get.side_effect = [
+            _allpages((1, "A", T1), (2, "B", T2)),
+            _revisions((2, "B", "b2")),
+        ]
+        _run_main(tmp_path, *args)
+        assert mock_get.call_count == 2
+        assert mock_get.call_args.kwargs["params"]["pageids"] == "2"
+        assert (self._out(tmp_path) / "B.2.mediawiki").read_text(
+            encoding="utf-8"
+        ) == "b2"
+
+    @patch("scrape.verify_wiki_exists", return_value=True)
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_no_tracking_refetches_everything(
+        self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
+    ) -> None:
+        args = [*ONLY_WIKITEXT, "--mediawiki-tracking", "none"]
+        allpages = _allpages((1, "A", T1))
+        for _ in range(2):
+            mock_get.reset_mock()
+            mock_get.side_effect = [allpages, _revisions((1, "A", "a"))]
+            _run_main(tmp_path, *args)
+            assert mock_get.call_count == 2
+
+        assert not (tmp_path / "test.db").exists()
+        assert sorted(p.name for p in self._out(tmp_path).iterdir()) == [
+            "A.1.mediawiki"
+        ]
+
+    @pytest.mark.parametrize("tracking", ["db", "manifest", "none"])
+    @patch("scrape.verify_wiki_exists", return_value=True)
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_rename_removes_old_file(
+        self,
+        mock_get: MagicMock,
+        mock_verify: MagicMock,
+        tmp_path: Path,
+        tracking: str,
+    ) -> None:
+        args = [*ONLY_WIKITEXT, "--mediawiki-tracking", tracking]
+        mock_get.side_effect = [_allpages((1, "Old", T1)), _revisions((1, "Old", "x"))]
+        _run_main(tmp_path, *args)
+        mock_get.side_effect = [_allpages((1, "New", T2)), _revisions((1, "New", "x"))]
+        _run_main(tmp_path, *args)
+
+        files = sorted(
+            p.name for p in self._out(tmp_path).iterdir() if p.suffix == ".mediawiki"
+        )
+        assert files == ["New.1.mediawiki"]
+
+    @patch("scrape.verify_wiki_exists", return_value=True)
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_page_without_wikitext_retried_next_run(
+        self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
+    ) -> None:
+        allpages = _allpages((1, "A", T1), (2, "B", T1))
+        mock_get.side_effect = [allpages, _revisions((1, "A", "a"))]
+        _run_main(tmp_path, *ONLY_WIKITEXT)
+
+        mock_get.reset_mock()
+        mock_get.side_effect = [allpages, _revisions((2, "B", "b"))]
+        _run_main(tmp_path, *ONLY_WIKITEXT)
+        assert mock_get.call_args.kwargs["params"]["pageids"] == "2"
+        assert (self._out(tmp_path) / "B.2.mediawiki").exists()

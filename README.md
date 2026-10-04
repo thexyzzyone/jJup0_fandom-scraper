@@ -32,6 +32,44 @@ python server.py spiritfarer --no-scrape
 
 Each wiki gets its own database (`<wiki>.db`) and asset directory (`static/<wiki>/`).
 
+### Choosing what to scrape
+
+By default the scraper stores rendered HTML (with its search index), downloads images, and downloads the wiki's theme CSS. These flags change that, and any combination is allowed:
+
+| Flag | Effect |
+|---|---|
+| `--with-mediawiki` | Also save each page's raw wikitext to `<wiki>-mediawiki/<Title>.<pageid>.mediawiki` |
+| `--no-html` | Don't store rendered HTML. `server.py` has nothing to serve from this database. |
+| `--no-images` | Don't download images. Stored HTML keeps pointing at Fandom's servers, so images only load while you're online. |
+| `--no-style` | Don't download theme CSS (`static/<wiki>/theme.css`) |
+
+```bash
+# Everything, plus wikitext files
+python scrape.py spiritfarer --with-mediawiki
+
+# Searchable text with no media
+python scrape.py spiritfarer --no-images --no-style
+
+# Wikitext files only
+python scrape.py spiritfarer --with-mediawiki --no-html --no-images --no-style
+```
+
+Turning everything off is an error. A later run without `--no-images` downloads the missing images and switches stored pages to the local copies. With `--no-html`, images are still downloaded (unless `--no-images` is also given): the scraper asks the API for every image used on an article page, which is the same set a normal scrape downloads.
+
+#### Wikitext files
+
+Each `.mediawiki` file is the page's source exactly as stored on the wiki. Filenames end in the pageid so pages whose titles differ only by case (common with redirects) don't overwrite each other on case-insensitive filesystems. Characters that aren't safe in filenames (`/ \ : % * ? " < > |`) are percent-encoded, and spaces become underscores. When a page is renamed on the wiki, its old file is deleted.
+
+`--mediawiki-tracking` sets where the scraper remembers which wikitext it has already saved, so reruns only fetch new or changed pages:
+
+| `--mediawiki-tracking` | Bookkeeping | Reruns |
+|---|---|---|
+| `db` (default) | `wikitext_pages` table in `<wiki>.db` (pageid, title, timestamp; never the page text) | Fetch only new or changed pages |
+| `manifest` | `<wiki>-mediawiki/_index.json` | Fetch only new or changed pages |
+| `none` | Nothing | Fetch every page again |
+
+With `--no-html`, a `manifest` or `none` run creates no database at all. Wikitext is fetched 50 pages per request, so even `none` is fast compared with an HTML scrape.
+
 ### Optional: Full Fandom CSS (best visual fidelity)
 
 The scraper auto-downloads per-wiki theme variables (colors, fonts, background), but Fandom's full layout CSS is behind Cloudflare and can't be fetched programmatically. For pixel-perfect styling, extract it once from your browser:
@@ -70,6 +108,7 @@ static/
     theme.css              Per-wiki theme variables (auto-downloaded by scraper)
     images/                Wiki images, named by original filename
 <wiki>.db                  SQLite database per wiki (pages + FTS5 index)
+<wiki>-mediawiki/          Raw wikitext files (--with-mediawiki)
 templates/
   index.html               Search/browse page
   page.html                Wiki page viewer
@@ -96,6 +135,8 @@ Uses the MediaWiki API exclusively — no HTML scraping or browser automation.
 7. `wikia.php?controller=ThemeApi&method=themeVariables` — download theme CSS
 
 Rate limited to 0.5s between requests. Resumable — skips already-scraped pages and existing images.
+
+`--no-images` skips steps 3 and 4, `--no-style` skips step 7, and `--no-html` skips steps 2 and 5–6 (images then come from `action=query&generator=allpages&prop=images`). `--with-mediawiki` adds `action=query&prop=revisions&rvprop=content&rvslots=main`, 50 pageids per request.
 
 ### Search
 
