@@ -10,4 +10,5 @@ temp/
 test-artifacts/
 .*.status
 .venv/
+.env
 .mypy_cache/

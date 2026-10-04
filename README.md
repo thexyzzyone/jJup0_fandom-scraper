@@ -59,6 +59,7 @@ By default the scraper stores rendered HTML (with its search index), downloads e
 | `--prohibit-files` | Don't download non-image files (audio, video, fonts, documents, ...) |
 | `--permit-file-types='*.ogg,*.m4v'` | Only download non-image files whose names match one of these comma-separated globs. An empty list is the same as `--prohibit-files`. |
 | `--no-style` | Don't download theme CSS (`hive/<wiki>/static/theme.css`) |
+| `--fts=html` / `--fts=mediawiki` | What the search index is built from. `html` (the default): the rendered pages' text. `mediawiki`: only the wikitext files, even if HTML is also stored; turns on `--with-mediawiki` by itself. |
 
 ```bash
 # Everything, plus wikitext files
@@ -94,7 +95,13 @@ Each `.mediawiki` file is the page's source exactly as stored on the wiki. Filen
 | `manifest` | `hive/<wiki>/mediawiki/_index.json` | Fetch only new or changed pages |
 | `none` | Nothing | Fetch every page again |
 
-With `--no-html`, a `manifest` or `none` run creates no database at all. Wikitext is fetched 50 pages per request, so even `none` is fast compared with an HTML scrape.
+With `--no-html`, a `manifest` or `none` run creates no database at all (unless `--fts=mediawiki` needs one for its index). Wikitext is fetched 50 pages per request, so even `none` is fast compared with an HTML scrape.
+
+#### Search index from wikitext
+
+`--fts=mediawiki` builds the search index from the `.mediawiki` files instead of the HTML: markup is stripped, but template fields stay as words, so an infobox's `species = Owl` is searchable. Combined with `--no-html` the scraper never requests a rendered page, so a whole wiki takes a few requests per 50 pages (Spiritfarer's 864 pages index in about 15 seconds) and the database stays small. What you give up is text that only exists once Fandom expands templates, such as navboxes and generated lists, and the web UI if there's no HTML.
+
+The index tracks the files on disk: each run re-reads only files that changed and drops entries whose file is gone. The chosen mode is recorded in the database, and `server.py` and `mcp_serve.py` search whichever index it names. Switching back to `--fts=html` refills the HTML index from the stored HTML without re-downloading anything.
 
 ### Optional: Full Fandom CSS (best visual fidelity)
 
@@ -128,6 +135,8 @@ Without this step, the built-in fallback CSS handles infoboxes, tables, tabs, an
 ```
 scrape.py                  MediaWiki API scraper → SQLite + local images
 server.py                  Flask web server with FTS5 search
+mcp_serve.py               MCP server over the hive for AI agents (needs .env, see below)
+.env.example               Settings template for mcp_serve.py
 static/
   fandom-all.css           Fandom's layout CSS (extracted from browser, shared across wikis)
 hive/                      All scraped data (contents git-ignored)
@@ -181,6 +190,34 @@ python server.py <wiki> [--no-scrape] [--hive DIR] [--host 0.0.0.0] [--port 5000
 - `/wiki/<title>` — wiki page (underscores normalized to spaces, matching MediaWiki convention)
 - `/api/search?q=term` — JSON search endpoint
 
+## MCP server
+
+`mcp_serve.py` exposes the hive to AI agents over [MCP](https://modelcontextprotocol.io/) (streamable HTTP), read-only:
+
+| Tool | What it does |
+|---|---|
+| `list_hives` | The scraped wikis and what each contains (HTML pages, wikitext pages, media files, interrupted scrapes) |
+| `search` | Full-text search of one wiki; prefix matching, `"exact phrases"`. Uses the index chosen with `--fts`; falls back to scanning wikitext for wikis with neither index. |
+| `get_page` | One page by title: its wikitext if saved, otherwise its HTML. Follows redirects; long pages are cut at `max_chars`. |
+| `get_pages` | Up to 50 pages at once; missing ones are listed instead of failing the call |
+| `get_media` | A downloaded image, audio clip or other file (up to 20 MB) |
+
+It needs Python 3.10+ (for the `mcp` SDK). Every request must carry a static API key:
+
+```bash
+cp .env.example .env
+python -c "import secrets; print(secrets.token_urlsafe(32))"   # paste into FANDOM_MCP_API_KEY in .env
+python mcp_serve.py                                             # http://127.0.0.1:8765/mcp
+```
+
+`.env` also sets the bind address, port and hive (`FANDOM_MCP_HOST`, `FANDOM_MCP_PORT`, `FANDOM_HIVE`); `--host`, `--port`, `--hive` and `--env-file` override it, and real environment variables override the file. The default only accepts local connections. To serve other machines set `FANDOM_MCP_HOST=0.0.0.0`, and put TLS in front of it beyond a trusted network, since the key travels in a header.
+
+Clients send the key as `Authorization: Bearer <key>` (or `X-API-Key: <key>`). For Claude Code:
+
+```bash
+claude mcp add --transport http fandom-hive http://127.0.0.1:8765/mcp --header "Authorization: Bearer <key>"
+```
+
 ## Cloudflare Gotchas
 
 | Resource | Accessible? |
@@ -200,6 +237,7 @@ Fandom explicitly allows `/api.php?` for all bots. We're compliant.
 ## Dependencies
 
 - Python 3, `requests`, `flask`
+- For `mcp_serve.py`: Python 3.10+, `mcp`, `python-dotenv`
 - SQLite with FTS5 (included in Python's `sqlite3`)
 
 ## Development

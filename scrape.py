@@ -188,20 +188,24 @@ def get_wikitext(pageids: list[int]) -> dict[int, str]:
     return texts
 
 
-def wikitext_filename(pageid: int, title: str) -> str:
-    """Filesystem-safe `<title>.<pageid>.mediawiki` name.
-
-    The pageid keeps names unique on case-insensitive filesystems, where
-    redirects like "Foo Bar" and "Foo bar" would otherwise collide.
-    """
+def wikitext_stem(title: str) -> str:
+    """The filesystem-safe title part of a `.mediawiki` filename."""
     safe = re.sub(
         r'[\\/:%*?"<>|\x00-\x1f]',
         lambda m: f"%{ord(m.group()):02X}",
         title.replace(" ", "_"),
     )
     # Leave room for the suffix within the usual 255-byte filename limit
-    safe = safe.encode()[:200].decode(errors="ignore")
-    return f"{safe}.{pageid}.mediawiki"
+    return safe.encode()[:200].decode(errors="ignore")
+
+
+def wikitext_filename(pageid: int, title: str) -> str:
+    """Filesystem-safe `<title>.<pageid>.mediawiki` name.
+
+    The pageid keeps names unique on case-insensitive filesystems, where
+    redirects like "Foo Bar" and "Foo bar" would otherwise collide.
+    """
+    return f"{wikitext_stem(title)}.{pageid}.mediawiki"
 
 
 def get_page_images() -> set[str]:
@@ -353,9 +357,164 @@ def init_db(db_path: str) -> sqlite3.Connection:
             title TEXT NOT NULL,
             touched TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS wikitext_text (
+            pageid INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            plaintext TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            mtime_ns INTEGER NOT NULL
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS wikitext_fts USING fts5(
+            title, plaintext, content=wikitext_text, content_rowid=pageid
+        );
+        CREATE TRIGGER IF NOT EXISTS wikitext_ai AFTER INSERT ON wikitext_text BEGIN
+            INSERT INTO wikitext_fts(rowid, title, plaintext) VALUES (new.pageid, new.title, new.plaintext);
+        END;
+        CREATE TRIGGER IF NOT EXISTS wikitext_ad AFTER DELETE ON wikitext_text BEGIN
+            INSERT INTO wikitext_fts(wikitext_fts, rowid, title, plaintext) VALUES('delete', old.pageid, old.title, old.plaintext);
+        END;
+        CREATE TRIGGER IF NOT EXISTS wikitext_au AFTER UPDATE ON wikitext_text BEGIN
+            INSERT INTO wikitext_fts(wikitext_fts, rowid, title, plaintext) VALUES('delete', old.pageid, old.title, old.plaintext);
+            INSERT INTO wikitext_fts(rowid, title, plaintext) VALUES (new.pageid, new.title, new.plaintext);
+        END;
     """)
     conn.commit()
     return conn
+
+
+FTS_HTML = "html"
+FTS_MEDIAWIKI = "mediawiki"
+
+
+def get_fts_mode(conn: sqlite3.Connection) -> str:
+    """Which text the database's search index holds: FTS_HTML or FTS_MEDIAWIKI."""
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'fts'").fetchone()
+    except sqlite3.OperationalError:  # database from before --fts
+        return FTS_HTML
+    return str(row[0]) if row else FTS_HTML
+
+
+def fts_tables(conn: sqlite3.Connection) -> tuple[str, str]:
+    """(FTS table, its content table) for the database's search index."""
+    if get_fts_mode(conn) == FTS_MEDIAWIKI:
+        return "wikitext_fts", "wikitext_text"
+    return "pages_fts", "pages"
+
+
+def set_fts_mode(conn: sqlite3.Connection, mode: str) -> None:
+    """Record the index mode and keep only that index's text.
+
+    FTS_MEDIAWIKI empties `pages.plaintext` (HTML text isn't searched);
+    FTS_HTML refills it from the stored HTML and empties the wikitext index.
+    Does nothing if `mode` is already the recorded one.
+    """
+    recorded = conn.execute("SELECT value FROM meta WHERE key = 'fts'").fetchone()
+    if recorded is not None and recorded[0] == mode:
+        return
+    log.info("search index: switching to %s", mode)
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('fts', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (mode,),
+    )
+    if mode == FTS_MEDIAWIKI:
+        conn.execute("UPDATE pages SET plaintext = '' WHERE plaintext != ''")
+    else:
+        conn.execute("DELETE FROM wikitext_text")
+        rows = conn.execute(
+            "SELECT pageid, html FROM pages WHERE plaintext = '' AND html != ''"
+        ).fetchall()
+        conn.executemany(
+            "UPDATE pages SET plaintext = ? WHERE pageid = ?",
+            [(strip_text(html), pageid) for pageid, html in rows],
+        )
+    # Drop entries left behind by older versions, which replaced rows
+    # without removing their old text from the index
+    conn.execute("INSERT INTO pages_fts(pages_fts) VALUES ('rebuild')")
+    conn.commit()
+
+
+def wikitext_to_text(text: str) -> str:
+    """Rough plaintext of wikitext for search: markup removed, values kept.
+
+    Template names and parameters stay as words (an infobox's
+    `species = Owl` becomes "species Owl"), so they're searchable too.
+    """
+    text = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
+    # Table/tag formatting like align="center" or style="width:5em" (pages
+    # often leave the quote unclosed, so a | or line break also ends it)
+    text = re.sub(r'\b[\w-]+\s*=\s*"[^"|\n]*"?', " ", text)
+    text = re.sub(r"\|-+", " ", text)  # table row separators
+    # [[File:x.png|thumb|Caption]] -> Caption; [[Page|label]] -> label
+    text = re.sub(r"\[\[(?:[^\]|]*\|)*([^\]|]*)\]\]", lambda m: f" {m.group(1)} ", text)
+    text = re.sub(r"\[https?://\S+\s*([^\]]*)\]", r" \1 ", text)  # [url label]
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"__[A-Z]+__", " ", text)  # __TOC__, __NOTOC__
+    text = re.sub(r"'{2,}|={2,}|[{}|=\[\]]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_wikitext_filename(name: str) -> tuple[str, int] | None:
+    """(title, pageid) from a `<Title>.<pageid>.mediawiki` filename."""
+    m = re.fullmatch(r"(.*)\.(\d+)\.mediawiki", name)
+    if not m:
+        return None
+    return urllib.parse.unquote(m.group(1)).replace("_", " "), int(m.group(2))
+
+
+def index_wikitext(conn: sqlite3.Connection, mediawiki_dir: str) -> None:
+    """Sync the wikitext search index with the .mediawiki files on disk.
+
+    Files that are new or changed since they were indexed are (re)read;
+    index entries whose file is gone are dropped.
+    """
+    indexed: dict[int, tuple[str, int]] = {
+        r[0]: (r[1], r[2])
+        for r in conn.execute("SELECT pageid, filename, mtime_ns FROM wikitext_text")
+    }
+    on_disk: dict[int, tuple[str, int, str]] = {}
+    names = os.listdir(mediawiki_dir) if os.path.isdir(mediawiki_dir) else []
+    for name in names:
+        parsed = parse_wikitext_filename(name)
+        if parsed is None:
+            continue
+        title, pageid = parsed
+        mtime = os.stat(os.path.join(mediawiki_dir, name)).st_mtime_ns
+        if pageid not in on_disk or mtime > on_disk[pageid][1]:
+            on_disk[pageid] = (name, mtime, title)
+
+    changed = [
+        pid
+        for pid, (name, mtime, _) in on_disk.items()
+        if indexed.get(pid) != (name, mtime)
+    ]
+    for pageid in changed:
+        name, mtime, title = on_disk[pageid]
+        with open(os.path.join(mediawiki_dir, name), encoding="utf-8") as f:
+            plaintext = wikitext_to_text(f.read())
+        conn.execute(
+            "INSERT INTO wikitext_text (pageid, title, plaintext, filename, mtime_ns) "
+            "VALUES (?,?,?,?,?) ON CONFLICT(pageid) DO UPDATE SET title = "
+            "excluded.title, plaintext = excluded.plaintext, filename = "
+            "excluded.filename, mtime_ns = excluded.mtime_ns",
+            (pageid, title, plaintext, name, mtime),
+        )
+    gone = indexed.keys() - on_disk.keys()
+    conn.executemany(
+        "DELETE FROM wikitext_text WHERE pageid = ?", [(pid,) for pid in gone]
+    )
+    conn.commit()
+    log.info(
+        "wikitext index: %d pages, %d updated, %d removed",
+        len(on_disk),
+        len(changed),
+        len(gone),
+    )
 
 
 def find_stale(pages: list[PageInfo], existing: dict[int, str]) -> list[PageInfo]:
@@ -498,13 +657,22 @@ def download_missing_images(filenames: set[str], img_dir: str) -> dict[str, str]
 
 
 def scrape_html(
-    pages: list[PageInfo], db_path: str, img_dir: str, with_media: bool
+    pages: list[PageInfo],
+    db_path: str,
+    img_dir: str,
+    with_media: bool,
+    index_html: bool = True,
 ) -> None:
     """Store rendered HTML of new/changed pages in the DB, plus their media.
 
     `with_media` turns image/file downloads on at all; file_wanted() then
-    decides each one.
+    decides each one. Without `index_html` (--fts=mediawiki) the HTML's text
+    isn't stored for search.
     """
+
+    def plaintext(html: str) -> str:
+        return strip_text(html) if index_html else ""
+
     conn = init_db(db_path)
     c = conn.cursor()
 
@@ -554,13 +722,18 @@ def scrape_html(
         else:
             html = rewrite_html(parsed["html"], {})
 
+        # An upsert, not INSERT OR REPLACE: REPLACE skips the delete trigger,
+        # which would leave the old text in the search index
         c.execute(
-            "INSERT OR REPLACE INTO pages (pageid, title, html, plaintext, categories, touched) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO pages (pageid, title, html, plaintext, categories, touched) "
+            "VALUES (?,?,?,?,?,?) ON CONFLICT(pageid) DO UPDATE SET title = "
+            "excluded.title, html = excluded.html, plaintext = excluded.plaintext, "
+            "categories = excluded.categories, touched = excluded.touched",
             (
                 page["pageid"],
                 page["title"],
                 html,
-                strip_text(html),
+                plaintext(html),
                 json.dumps(parsed["categories"]),
                 page["touched"],
             ),
@@ -592,7 +765,7 @@ def scrape_html(
                 if new_html != row[1]:
                     c.execute(
                         "UPDATE pages SET html=?, plaintext=? WHERE pageid=?",
-                        (new_html, strip_text(new_html), row[0]),
+                        (new_html, plaintext(new_html), row[0]),
                     )
             conn.commit()
 
@@ -617,6 +790,14 @@ def main() -> None:
         "--with-mediawiki",
         action="store_true",
         help="Also save raw wikitext to <hive>/<wiki>/mediawiki/<Title>.<pageid>.mediawiki",
+    )
+    parser.add_argument(
+        "--fts",
+        choices=[FTS_HTML, FTS_MEDIAWIKI],
+        default=FTS_HTML,
+        help="What the search index is built from: html = the rendered pages' "
+        "text (default); mediawiki = only the wikitext files (implies "
+        "--with-mediawiki; HTML text is not indexed even if stored)",
     )
     parser.add_argument(
         "--mediawiki-tracking",
@@ -667,9 +848,11 @@ def main() -> None:
     with_files: bool = not (args.prohibit_files or permitted == [])
     with_media: bool = with_images or with_files
     with_style: bool = not args.no_style
-    if args.mediawiki_tracking and not args.with_mediawiki:
+    # The wikitext index needs the wikitext
+    with_mediawiki: bool = args.with_mediawiki or args.fts == FTS_MEDIAWIKI
+    if args.mediawiki_tracking and not with_mediawiki:
         parser.error("--mediawiki-tracking requires --with-mediawiki")
-    if not (with_html or with_media or with_style or args.with_mediawiki):
+    if not (with_html or with_media or with_style or with_mediawiki):
         parser.error("nothing to scrape: every kind of content is disabled")
 
     init_wiki(args.wiki)
@@ -699,16 +882,28 @@ def main() -> None:
             f.write(theme_css)
         log.info("Saved to %s", layout.theme)
 
-    pages = get_all_pages() if with_html or args.with_mediawiki else []
+    pages = get_all_pages() if with_html or with_mediawiki else []
+
+    # Record the index mode first, so the web UI searches the right index
+    # while the scrape runs; an HTML-only hive with no database yet gets
+    # one from scrape_html()
+    if args.fts == FTS_MEDIAWIKI or with_html or os.path.exists(layout.db):
+        conn = init_db(layout.db)
+        set_fts_mode(conn, args.fts)
+        conn.close()
 
     # Wikitext first: 50 pages per request, so it's done long before the HTML
-    if args.with_mediawiki:
+    if with_mediawiki:
         scrape_wikitext(
             pages, layout.mediawiki, args.mediawiki_tracking or "db", layout.db
         )
+    if args.fts == FTS_MEDIAWIKI:
+        conn = init_db(layout.db)
+        index_wikitext(conn, layout.mediawiki)
+        conn.close()
 
     if with_html:
-        scrape_html(pages, layout.db, layout.images, with_media)
+        scrape_html(pages, layout.db, layout.images, with_media, args.fts == FTS_HTML)
     elif with_media:
         # No HTML to read image names from, so ask the API what pages use
         download_missing_images(get_page_images(), layout.images)

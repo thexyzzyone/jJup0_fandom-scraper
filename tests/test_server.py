@@ -485,3 +485,22 @@ class TestApiSearch:
         titles = [r["title"] for r in data]
         assert titles.count("Gorogoa") == 1
         server._status_path = None
+
+
+class TestSearchIndexMode:
+    def test_uses_wikitext_index(self, client: FlaskClient, db_path: str) -> None:
+        import scrape
+
+        conn = scrape.init_db(db_path)
+        conn.execute(
+            "INSERT INTO wikitext_text (pageid, title, plaintext, filename, mtime_ns) "
+            "VALUES (2, 'Gorogoa', 'infobox developer Jason Roberts', 'x', 0)"
+        )
+        scrape.set_fts_mode(conn, scrape.FTS_MEDIAWIKI)
+        conn.close()
+
+        data = json.loads(client.get("/api/search?q=roberts").data)
+        assert [r["title"] for r in data] == ["Gorogoa"]
+        assert "<mark>Roberts</mark>" in data[0]["snip"]
+        # HTML text is no longer indexed in this mode
+        assert json.loads(client.get("/api/search?q=puzzle").data) == []

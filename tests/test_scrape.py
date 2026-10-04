@@ -1393,3 +1393,276 @@ class TestHiveLayout:
             "mywiki/static/images/pic.png",
             "mywiki/static/theme.css",
         ]
+
+
+# ---------------------------------------------------------------------------
+# --fts: search index source
+# ---------------------------------------------------------------------------
+class TestWikitextToText:
+    @pytest.mark.parametrize(
+        "wikitext, expected",
+        [
+            ("'''Bold''' and ''italic''", "Bold and italic"),
+            ("== Heading ==\nText", "Heading Text"),
+            ("[[Page]] and [[Other page|label]]", "Page and label"),
+            ("[[File:Pic.png|thumb|A caption]]", "A caption"),
+            ("[https://x.com Site] [https://y.com]", "Site"),
+            (
+                "{{Infobox|name = Gustav|species = Owl}}",
+                "Infobox name Gustav species Owl",
+            ),
+            ("a<!-- hidden -->b <ref>Source</ref>", "a b Source"),
+            ("__NOTOC__ text", "text"),
+            (
+                '{| class="wikitable"\n|-\n| align="center" rowspan=2 | Owl\n|}',
+                "rowspan 2 Owl",
+            ),
+            ('| style="color: red | Lily', "Lily"),
+        ],
+    )
+    def test_strips_markup(self, wikitext: str, expected: str) -> None:
+        assert scrape.wikitext_to_text(wikitext) == expected
+
+
+class TestParseWikitextFilename:
+    @pytest.mark.parametrize(
+        "title", ["Main Page", "AC/DC", "Foo: Bar", "100%", "Über Page", "a.b.c"]
+    )
+    def test_round_trip(self, title: str) -> None:
+        name = scrape.wikitext_filename(42, title)
+        assert scrape.parse_wikitext_filename(name) == (title, 42)
+
+    @pytest.mark.parametrize("name", ["_index.json", "x.mediawiki", "x.1.txt"])
+    def test_rejects_other_files(self, name: str) -> None:
+        assert scrape.parse_wikitext_filename(name) is None
+
+
+class TestIndexWikitext:
+    def _search(self, conn: sqlite3.Connection, q: str) -> list[str]:
+        return [
+            r[0]
+            for r in conn.execute(
+                "SELECT t.title FROM wikitext_fts JOIN wikitext_text t "
+                "ON t.pageid = wikitext_fts.rowid WHERE wikitext_fts MATCH ?",
+                (q,),
+            )
+        ]
+
+    def test_sync(self, db: sqlite3.Connection, tmp_path: Path) -> None:
+        mw = tmp_path / "mediawiki"
+        mw.mkdir()
+        (mw / "Owl.1.mediawiki").write_text("{{Bird|call = hoot}}")
+        (mw / "Fox.2.mediawiki").write_text("A [[Fox|vulpine]] animal")
+        (mw / "_index.json").write_text("{}")
+        scrape.index_wikitext(db, str(mw))
+        assert self._search(db, "hoot") == ["Owl"]
+        assert self._search(db, "vulpine") == ["Fox"]
+
+        # Changed, renamed and deleted files
+        owl = mw / "Owl.1.mediawiki"
+        owl.write_text("{{Bird|call = screech}}")
+        os.utime(owl, ns=(1, owl.stat().st_mtime_ns + 10**9))
+        (mw / "Fox.2.mediawiki").rename(mw / "Red_Fox.2.mediawiki")
+        (mw / "Cat.3.mediawiki").write_text("meow")
+        scrape.index_wikitext(db, str(mw))
+        assert self._search(db, "hoot") == []
+        assert self._search(db, "screech") == ["Owl"]
+        assert self._search(db, "vulpine") == ["Red Fox"]
+        assert self._search(db, "meow") == ["Cat"]
+
+        (mw / "Cat.3.mediawiki").unlink()
+        scrape.index_wikitext(db, str(mw))
+        assert self._search(db, "meow") == []
+        assert db.execute("SELECT COUNT(*) FROM wikitext_text").fetchone()[0] == 2
+
+    def test_unchanged_files_not_reread(
+        self, db: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        mw = tmp_path / "mediawiki"
+        mw.mkdir()
+        (mw / "Owl.1.mediawiki").write_text("hoot")
+        scrape.index_wikitext(db, str(mw))
+        with patch("scrape.wikitext_to_text") as convert:
+            scrape.index_wikitext(db, str(mw))
+        convert.assert_not_called()
+
+    def test_missing_dir(self, db: sqlite3.Connection, tmp_path: Path) -> None:
+        scrape.index_wikitext(db, str(tmp_path / "nope"))
+
+
+class TestFtsMode:
+    def _insert(self, db: sqlite3.Connection, html: str) -> None:
+        db.execute(
+            "INSERT INTO pages (pageid,title,html,plaintext,categories,touched) "
+            "VALUES (1,'P',?,?,'[]','')",
+            (html, scrape.strip_text(html)),
+        )
+
+    def _matches(self, db: sqlite3.Connection, q: str) -> bool:
+        return bool(
+            db.execute(
+                "SELECT 1 FROM pages_fts WHERE pages_fts MATCH ?", (q,)
+            ).fetchall()
+        )
+
+    def test_default_is_html(self, db: sqlite3.Connection) -> None:
+        assert scrape.get_fts_mode(db) == scrape.FTS_HTML
+        assert scrape.fts_tables(db) == ("pages_fts", "pages")
+
+    def test_old_database_without_meta(self, tmp_path: Path) -> None:
+        conn = sqlite3.connect(tmp_path / "old.db")
+        assert scrape.get_fts_mode(conn) == scrape.FTS_HTML
+        conn.close()
+
+    def test_switching(self, db: sqlite3.Connection) -> None:
+        self._insert(db, "<p>hello world</p>")
+        db.execute(
+            "INSERT INTO wikitext_text VALUES (1, 'P', 'wikitext words', 'P.1.mediawiki', 0)"
+        )
+        scrape.set_fts_mode(db, scrape.FTS_MEDIAWIKI)
+        assert scrape.fts_tables(db) == ("wikitext_fts", "wikitext_text")
+        assert db.execute("SELECT plaintext, html FROM pages").fetchone() == (
+            "",
+            "<p>hello world</p>",
+        )
+        assert not self._matches(db, "hello")
+
+        scrape.set_fts_mode(db, scrape.FTS_HTML)
+        assert db.execute("SELECT plaintext FROM pages").fetchone()[0] == "hello world"
+        assert self._matches(db, "hello")
+        assert db.execute("SELECT COUNT(*) FROM wikitext_text").fetchone()[0] == 0
+
+    def test_rebuild_drops_stale_entries(self, db: sqlite3.Connection) -> None:
+        # How older versions wrote pages: REPLACE skips the delete trigger
+        self._insert(db, "<p>oldword</p>")
+        db.execute("UPDATE pages SET plaintext = plaintext")  # no-op write
+        db.execute(
+            "INSERT OR REPLACE INTO pages (pageid,title,html,plaintext,categories,touched) "
+            "VALUES (1,'P','<p>newword</p>','newword','[]','')"
+        )
+        assert self._matches(db, "oldword")
+        scrape.set_fts_mode(db, scrape.FTS_HTML)
+        assert not self._matches(db, "oldword")
+        assert self._matches(db, "newword")
+
+    def test_same_mode_is_a_no_op(self, db: sqlite3.Connection) -> None:
+        scrape.set_fts_mode(db, scrape.FTS_HTML)
+        with patch.object(scrape, "strip_text") as strip:
+            scrape.set_fts_mode(db, scrape.FTS_HTML)
+        strip.assert_not_called()
+
+
+class TestFtsFlag:
+    @patch("scrape.verify_wiki_exists", return_value=True)
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_rescrape_drops_old_words(
+        self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
+    ) -> None:
+        def parse(text: str) -> MagicMock:
+            return _mock_resp(
+                {
+                    "parse": {
+                        "text": {"*": f"<p>{text}</p>"},
+                        "categories": [],
+                        "images": [],
+                    }
+                }
+            )
+
+        args = ["--no-images", "--prohibit-files", "--no-style"]
+        mock_get.side_effect = [_allpages((1, "P", T1)), parse("oldword")]
+        _run_main(tmp_path, *args)
+        mock_get.side_effect = [_allpages((1, "P", T2)), parse("newword")]
+        _run_main(tmp_path, *args)
+
+        conn = sqlite3.connect(tmp_path / "mywiki" / "mywiki.db")
+        match = "SELECT COUNT(*) FROM pages_fts WHERE pages_fts MATCH ?"
+        assert conn.execute(match, ("newword",)).fetchone()[0] == 1
+        assert conn.execute(match, ("oldword",)).fetchone()[0] == 0
+        conn.close()
+
+    @patch("scrape.verify_wiki_exists", return_value=True)
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_mediawiki_without_html_never_fetches_html(
+        self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
+    ) -> None:
+        # --fts=mediawiki turns on wikitext fetching by itself
+        mock_get.side_effect = [
+            _allpages((1, "Owl", T1)),
+            _revisions((1, "Owl", "{{Bird|call = hoot}}")),
+        ]
+        _run_main(
+            tmp_path,
+            "--fts=mediawiki",
+            "--no-html",
+            "--no-images",
+            "--prohibit-files",
+            "--no-style",
+        )
+        actions = [c.kwargs["params"].get("action") for c in mock_get.call_args_list]
+        assert "parse" not in actions
+        assert mock_get.call_count == 2
+
+        conn = sqlite3.connect(tmp_path / "mywiki" / "mywiki.db")
+        assert scrape.get_fts_mode(conn) == scrape.FTS_MEDIAWIKI
+        hits = conn.execute(
+            "SELECT rowid FROM wikitext_fts WHERE wikitext_fts MATCH 'hoot'"
+        ).fetchall()
+        assert hits == [(1,)]
+        assert conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0] == 0
+        conn.close()
+
+    @patch("scrape.verify_wiki_exists", return_value=True)
+    @patch.object(scrape, "RATE_LIMIT", 0)
+    @patch.object(scrape.SESSION, "get")
+    def test_mediawiki_with_html_stores_html_but_indexes_wikitext(
+        self, mock_get: MagicMock, mock_verify: MagicMock, tmp_path: Path
+    ) -> None:
+        mock_get.side_effect = [
+            _allpages((1, "P", T1)),
+            _revisions((1, "P", "wikitextword")),
+            _mock_resp(
+                {
+                    "parse": {
+                        "text": {"*": "<p>htmlword</p>"},
+                        "categories": [],
+                        "images": [],
+                    }
+                }
+            ),
+        ]
+        _run_main(
+            tmp_path,
+            "--fts=mediawiki",
+            "--mediawiki-tracking=manifest",
+            "--no-images",
+            "--prohibit-files",
+            "--no-style",
+        )
+        conn = sqlite3.connect(tmp_path / "mywiki" / "mywiki.db")
+        assert conn.execute("SELECT html, plaintext FROM pages").fetchone() == (
+            "<p>htmlword</p>",
+            "",
+        )
+        assert not conn.execute(
+            "SELECT 1 FROM pages_fts WHERE pages_fts MATCH 'htmlword'"
+        ).fetchall()
+        assert conn.execute(
+            "SELECT 1 FROM wikitext_fts WHERE wikitext_fts MATCH 'wikitextword'"
+        ).fetchall()
+        conn.close()
+
+    def test_fts_mediawiki_allows_tracking_without_with_mediawiki(
+        self, tmp_path: Path
+    ) -> None:
+        with patch("scrape.verify_wiki_exists", return_value=False):
+            with pytest.raises(SystemExit) as exc:
+                _run_main(tmp_path, "--fts=mediawiki", "--mediawiki-tracking=none")
+        assert exc.value.code == 1  # got past argument checks to the wiki check
+
+    def test_invalid_fts_value(self, tmp_path: Path) -> None:
+        with pytest.raises(SystemExit) as exc:
+            _run_main(tmp_path, "--fts=both")
+        assert exc.value.code == 2

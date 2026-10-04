@@ -34,13 +34,21 @@ pages (
   pageid     INTEGER PRIMARY KEY,  -- MediaWiki page ID
   title      TEXT,                 -- "Page title" with spaces, as on the wiki
   html       TEXT,                 -- rendered page HTML (links rewritten to /wiki/<Title>)
-  plaintext  TEXT,                 -- html with tags stripped; used for search
+  plaintext  TEXT,                 -- html with tags stripped; used for search ('' with --fts=mediawiki)
   categories TEXT,                 -- JSON array, e.g. ["Years", "Age_of_Humanity"]
   touched    TEXT                  -- last change on the wiki, e.g. 2025-06-26T14:52:58Z
 )
 pages_fts       -- FTS5 index over pages(title, plaintext); rowid = pageid
+wikitext_text (                    -- wikitext as search text (only with --fts=mediawiki)
+  pageid, title, plaintext,        -- plaintext: markup stripped, template fields kept as words
+  filename, mtime_ns               -- which .mediawiki file it came from
+)
+wikitext_fts    -- FTS5 index over wikitext_text(title, plaintext); rowid = pageid
 wikitext_pages  -- (pageid, title, touched) of saved .mediawiki files; bookkeeping only
+meta            -- key/value; key 'fts' says which index is in use: 'html' (default) or 'mediawiki'
 ```
+
+**Which search index to use:** `SELECT value FROM meta WHERE key = 'fts'`. If it says `mediawiki`, search `wikitext_fts` joined to `wikitext_text`; otherwise (or if there's no `meta` table) search `pages_fts` joined to `pages`. Only one of them is filled at a time.
 
 Useful queries (`sqlite3 hive/<wiki>/<wiki>.db`):
 
@@ -49,6 +57,11 @@ Useful queries (`sqlite3 hive/<wiki>/<wiki>.db`):
 SELECT p.title, snippet(pages_fts, 1, '[', ']', '...', 12)
 FROM pages_fts JOIN pages p ON p.pageid = pages_fts.rowid
 WHERE pages_fts MATCH 'dragon*' ORDER BY rank LIMIT 10;
+
+-- The same, for a wiki indexed with --fts=mediawiki
+SELECT t.title, snippet(wikitext_fts, 1, '[', ']', '...', 12)
+FROM wikitext_fts JOIN wikitext_text t ON t.pageid = wikitext_fts.rowid
+WHERE wikitext_fts MATCH 'dragon*' ORDER BY rank LIMIT 10;
 
 -- One page's text
 SELECT plaintext FROM pages WHERE title = 'Waterdeep';
@@ -80,6 +93,10 @@ python scrape.py --help                    # every option
 ```
 
 Rerun with the same flags the wiki was scraped with. Don't edit files here by hand; the next scrape may overwrite them.
+
+## Over MCP
+
+If you're connected to the `fandom-hive` MCP server (`mcp_serve.py` in the repository root), use its tools instead of reading these files: `list_hives`, `search`, `get_page` / `get_pages` (wikitext when saved, otherwise HTML, with redirects followed) and `get_media`. They read the same data described above. The server needs an API key in the repository's `.env`; see the README's "MCP server" section to run it.
 
 ## Browsing in the web UI
 

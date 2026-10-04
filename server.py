@@ -67,11 +67,15 @@ def _search(db: sqlite3.Connection, q: str, limit: int = 100) -> list[sqlite3.Ro
     if not words:
         return []
     fts_q = " ".join(w + "*" for w in words)
+    from scrape import fts_tables
+
+    # The HTML index, or the wikitext one for hives scraped with --fts=mediawiki
+    fts, content = fts_tables(db)
     rows = db.execute(
-        """SELECT p.pageid, p.title,
-                  snippet(pages_fts, 1, '<mark>', '</mark>', '...', 40) as snip
-           FROM pages_fts JOIN pages p ON p.pageid = pages_fts.rowid
-           WHERE pages_fts MATCH ? ORDER BY rank LIMIT ?""",
+        f"""SELECT p.pageid, p.title,
+                  snippet({fts}, 1, '<mark>', '</mark>', '...', 40) as snip
+           FROM {fts} JOIN {content} p ON p.pageid = {fts}.rowid
+           WHERE {fts} MATCH ? ORDER BY rank LIMIT ?""",
         (fts_q, limit),
     ).fetchall()
     ql = q.lower()
